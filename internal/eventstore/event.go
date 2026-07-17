@@ -14,6 +14,8 @@ import (
 	"time"
 	"unicode"
 	"unicode/utf8"
+
+	"github.com/Versifine/study-monitor/internal/strictjson"
 )
 
 const EventSchemaVersion = 1
@@ -132,6 +134,9 @@ func (store *Store) AppendBatch(ctx context.Context, candidates []Candidate) ([]
 		}
 		results[index] = result
 	}
+	if hook, ok := ctx.Value(beforeCommitHookKey{}).(func()); ok {
+		hook()
+	}
 	if err := tx.Commit(); err != nil {
 		return nil, classifySQLiteError(CodeWriteFailed, "commit event batch", err)
 	}
@@ -194,6 +199,9 @@ func (store *Store) prepare(raw json.RawMessage, receivedAt string) (*preparedEv
 	if len(raw) > store.maxEventBytes {
 		return nil, &validationError{code: CodeEventTooLarge, err: errors.New("event exceeds configured byte limit")}
 	}
+	if err := strictjson.ValidateObjectKeys(raw, 0); err != nil {
+		return nil, &validationError{code: CodeEventDecodeInvalid, err: errors.New("event JSON contains a duplicate object key or is invalid")}
+	}
 	decoder := json.NewDecoder(bytes.NewReader(raw))
 	decoder.DisallowUnknownFields()
 	decoder.UseNumber()
@@ -215,6 +223,9 @@ func (store *Store) prepare(raw json.RawMessage, receivedAt string) (*preparedEv
 	}
 	if len(input.DeviceTimestampRaw) == 0 || len(input.DeviceTimestampRaw) > 128 || strings.TrimSpace(input.DeviceTimestampRaw) != input.DeviceTimestampRaw {
 		return nil, &validationError{code: CodeDeviceTimeInvalid, err: errors.New("device_timestamp_raw is invalid")}
+	}
+	if strings.HasSuffix(input.DeviceTimestampRaw, "-00:00") {
+		return nil, &validationError{code: CodeDeviceTimeInvalid, err: errors.New("device_timestamp_raw uses an unknown RFC3339 offset")}
 	}
 	deviceTime, err := time.Parse(time.RFC3339Nano, input.DeviceTimestampRaw)
 	if err != nil {
@@ -280,6 +291,10 @@ func (store *Store) prepare(raw json.RawMessage, receivedAt string) (*preparedEv
 		ContentHash:        hex.EncodeToString(contentDigest[:]),
 	}, nil
 }
+
+// beforeCommitHookKey is a private fault-injection seam for package tests. No
+// production caller outside eventstore can construct this context key.
+type beforeCommitHookKey struct{}
 
 func parsePayload(raw json.RawMessage, maxDepth int) (any, error) {
 	if len(raw) == 0 {

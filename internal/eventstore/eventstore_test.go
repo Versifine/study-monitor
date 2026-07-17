@@ -1,6 +1,7 @@
 package eventstore
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"encoding/json"
@@ -155,6 +156,73 @@ func TestAppendBatchIsIdempotentAndRejectsBadItemsIndependently(t *testing.T) {
 	if page.Events[0].DeviceTimeUTC != "2026-07-18T02:00:00Z" || page.Events[0].ReceivedAtUTC != "2026-07-18T03:04:05Z" {
 		t.Fatalf("unexpected normalized/server time: %#v", page.Events[0])
 	}
+}
+
+func TestEventRejectsDuplicateKeysAtEveryObjectLevel(t *testing.T) {
+	store := openTestStore(t, filepath.Join(t.TempDir(), "events.db"))
+	defer store.Close()
+
+	base := string(testEvent("duplicate", "study.activity", `{}`))
+	tests := []struct {
+		name string
+		raw  string
+	}{
+		{
+			name: "event field",
+			raw:  strings.Replace(base, `"idempotency_key":"duplicate"`, `"idempotency_key":"discarded","idempotency_key":"duplicate"`, 1),
+		},
+		{
+			name: "payload field",
+			raw:  strings.Replace(base, `"payload":{}`, `"payload":{"first":1},"payload":{"second":2}`, 1),
+		},
+		{
+			name: "nested payload key",
+			raw:  string(testEvent("nested-duplicate", "study.activity", `{"nested":{"key":1,"key":2}}`)),
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			results, err := store.AppendBatch(context.Background(), []Candidate{{Raw: json.RawMessage(test.raw)}})
+			if err != nil || len(results) != 1 || results[0].Status != StatusRejected || results[0].ErrorCode != CodeEventDecodeInvalid {
+				t.Fatalf("AppendBatch() = %#v, %v", results, err)
+			}
+		})
+	}
+	assertEventCount(t, store.db, 0)
+}
+
+func TestDeviceTimeRejectsUnknownNegativeZeroOffset(t *testing.T) {
+	store := openTestStore(t, filepath.Join(t.TempDir(), "events.db"))
+	defer store.Close()
+
+	tests := []struct {
+		name   string
+		key    string
+		time   string
+		status string
+	}{
+		{name: "Z", key: "utc-z", time: "2026-07-18T02:00:00Z", status: StatusAccepted},
+		{name: "positive zero", key: "utc-plus-zero", time: "2026-07-18T02:00:00+00:00", status: StatusAccepted},
+		{name: "unknown negative zero", key: "utc-unknown", time: "2026-07-18T02:00:00-00:00", status: StatusRejected},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			raw := strings.Replace(
+				string(testEvent(test.key, "study.activity", `{}`)),
+				"2026-07-18T10:00:00+08:00",
+				test.time,
+				1,
+			)
+			results, err := store.AppendBatch(context.Background(), []Candidate{{Raw: json.RawMessage(raw)}})
+			if err != nil || results[0].Status != test.status {
+				t.Fatalf("AppendBatch() = %#v, %v", results, err)
+			}
+			if test.status == StatusRejected && results[0].ErrorCode != CodeDeviceTimeInvalid {
+				t.Fatalf("error code = %q, want %q", results[0].ErrorCode, CodeDeviceTimeInvalid)
+			}
+		})
+	}
+	assertEventCount(t, store.db, 2)
 }
 
 func TestConcurrentSameIdempotencyKeyCreatesOneEvent(t *testing.T) {
@@ -354,6 +422,85 @@ func TestConfirmedWriteSurvivesAbruptProcessExit(t *testing.T) {
 	}
 }
 
+func TestInFlightBatchTerminationLeavesNoPartialFactsAndRetrySucceeds(t *testing.T) {
+	if os.Getenv("EXAM_MONITOR_INFLIGHT_HELPER") == "1" {
+		path := os.Getenv("EXAM_MONITOR_INFLIGHT_DATABASE")
+		marker := os.Getenv("EXAM_MONITOR_INFLIGHT_MARKER")
+		store, err := Open(context.Background(), path, testOptions())
+		if err != nil {
+			os.Exit(51)
+		}
+		ctx := context.WithValue(context.Background(), beforeCommitHookKey{}, func() {
+			if err := os.WriteFile(marker, []byte("before-commit"), 0o600); err != nil {
+				os.Exit(52)
+			}
+			time.Sleep(time.Hour)
+		})
+		_, _ = store.AppendBatch(ctx, inFlightCandidates())
+		os.Exit(53)
+	}
+
+	directory := t.TempDir()
+	path := filepath.Join(directory, "events.db")
+	marker := filepath.Join(directory, "before-commit.marker")
+	command := exec.Command(os.Args[0], "-test.run=^TestInFlightBatchTerminationLeavesNoPartialFactsAndRetrySucceeds$")
+	command.Env = append(os.Environ(),
+		"EXAM_MONITOR_INFLIGHT_HELPER=1",
+		"EXAM_MONITOR_INFLIGHT_DATABASE="+path,
+		"EXAM_MONITOR_INFLIGHT_MARKER="+marker,
+	)
+	var output bytes.Buffer
+	command.Stdout = &output
+	command.Stderr = &output
+	if err := command.Start(); err != nil {
+		t.Fatal(err)
+	}
+	waitResult := make(chan error, 1)
+	go func() { waitResult <- command.Wait() }()
+	stopped := false
+	defer func() {
+		if !stopped {
+			_ = command.Process.Kill()
+			<-waitResult
+		}
+	}()
+
+	deadline := time.NewTimer(5 * time.Second)
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer deadline.Stop()
+	defer ticker.Stop()
+	reachedBeforeCommit := false
+	for !reachedBeforeCommit {
+		select {
+		case err := <-waitResult:
+			stopped = true
+			t.Fatalf("helper exited before commit barrier: %v\n%s", err, output.String())
+		case <-deadline.C:
+			t.Fatalf("helper did not reach commit barrier\n%s", output.String())
+		case <-ticker.C:
+			if _, err := os.Stat(marker); err == nil {
+				reachedBeforeCommit = true
+			}
+		}
+	}
+	if err := command.Process.Kill(); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-waitResult; err == nil {
+		t.Fatal("killed helper unexpectedly exited successfully")
+	}
+	stopped = true
+
+	store := openTestStore(t, path)
+	defer store.Close()
+	assertEventCount(t, store.db, 0)
+	results, err := store.AppendBatch(context.Background(), inFlightCandidates())
+	if err != nil || len(results) != 2 || results[0].Status != StatusAccepted || results[1].Status != StatusAccepted {
+		t.Fatalf("retry after in-flight termination = %#v, %v", results, err)
+	}
+	assertEventCount(t, store.db, 2)
+}
+
 func TestReadinessDistinguishesWritableBusyAndReadOnly(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "events.db")
 	options := testOptions()
@@ -433,6 +580,13 @@ func openRawDatabase(t *testing.T, path string) *sql.DB {
 
 func testEvent(key, eventType, payload string) json.RawMessage {
 	return json.RawMessage(fmt.Sprintf(`{"schema_version":1,"collector_id":"desktop","event_type":%q,"device_timestamp_raw":"2026-07-18T10:00:00+08:00","clock_offset_ms":250,"clock_error_ms":50,"idempotency_key":%q,"payload":%s}`, eventType, key, payload))
+}
+
+func inFlightCandidates() []Candidate {
+	return []Candidate{
+		{Raw: testEvent("inflight-one", "study.activity", `{"position":1}`)},
+		{Raw: testEvent("inflight-two", "study.activity", `{"position":2}`)},
+	}
 }
 
 func appendAccepted(t *testing.T, store *Store, key string) int64 {

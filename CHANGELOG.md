@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- 修复 M1 审查问题：拒绝 envelope、事件和 payload 的重复 JSON key，拒绝未知 offset `-00:00`，并用提交前进程终止测试证明批次无部分残留且可安全重放。
 - 完成 M1：SQLite WAL、只前向校验迁移、仅追加结构化 Evidence、幂等批量写入、稳定快照分页和存储就绪检查。
 - 固定无 CGO SQLite 驱动及 vendor 依赖；Windows dev/test/build 在关闭模块代理时运行，M1 smoke 覆盖写入、重放、冲突、查询和重启恢复。
 - 增加 M1 损坏输入、迁移失败、并发同键、事务回滚、数据库锁、异常退出和只读降级测试；未进入媒体、采集器、覆盖率、前端或 AI。

@@ -1,6 +1,7 @@
 package httpapi
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -13,6 +14,7 @@ import (
 	"github.com/Versifine/study-monitor/internal/config"
 	"github.com/Versifine/study-monitor/internal/eventstore"
 	"github.com/Versifine/study-monitor/internal/logging"
+	"github.com/Versifine/study-monitor/internal/strictjson"
 	"github.com/Versifine/study-monitor/internal/version"
 )
 
@@ -142,18 +144,27 @@ func (handler *Handler) handleEventBatch(writer http.ResponseWriter, request *ht
 	}
 
 	request.Body = http.MaxBytesReader(writer, request.Body, handler.config.API.MaxRequestBytes)
-	var envelope struct {
-		SchemaVersion int               `json:"schema_version"`
-		Events        []json.RawMessage `json:"events"`
-	}
-	decoder := json.NewDecoder(request.Body)
-	decoder.DisallowUnknownFields()
-	if err := decoder.Decode(&envelope); err != nil {
+	rawBody, err := io.ReadAll(request.Body)
+	if err != nil {
 		var tooLarge *http.MaxBytesError
 		if errors.As(err, &tooLarge) {
 			writeError(writer, request, http.StatusRequestEntityTooLarge, CodeBodyTooLarge, "request body exceeds configured limit")
 			return
 		}
+		writeError(writer, request, http.StatusBadRequest, CodeJSONInvalid, "request JSON cannot be read")
+		return
+	}
+	if err := strictjson.ValidateObjectKeys(rawBody, 1); err != nil {
+		writeError(writer, request, http.StatusBadRequest, CodeJSONInvalid, "request JSON is invalid")
+		return
+	}
+	var envelope struct {
+		SchemaVersion int               `json:"schema_version"`
+		Events        []json.RawMessage `json:"events"`
+	}
+	decoder := json.NewDecoder(bytes.NewReader(rawBody))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&envelope); err != nil {
 		writeError(writer, request, http.StatusBadRequest, CodeJSONInvalid, "request JSON is invalid")
 		return
 	}

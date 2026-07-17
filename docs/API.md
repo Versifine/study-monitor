@@ -4,7 +4,7 @@
 
 ## 1. 通用规则
 
-- API JSON schema 版本为 `1`；请求 envelope 和事件对象的未知字段、尾随 JSON 被拒绝。`payload` 是采集器定义的 JSON 对象，但仍受大小、深度、有效 JSON 和重复 key 检查约束。
+- API JSON schema 版本为 `1`；请求 envelope 和事件对象的未知字段、任何对象层级的重复 key、尾随 JSON 均被拒绝。`payload` 是采集器定义的 JSON 对象，但仍受大小、深度和有效 JSON 检查约束。
 - 写入端点只接受 `Content-Type: application/json`，任何非空 `Origin` 请求头都被拒绝，防止本地网页静默提交。
 - 响应包含 `Cache-Control: no-store`；错误响应包含稳定错误码，不返回或记录 Evidence payload。
 - 请求体、批量条数、单事件大小、payload 深度、并发写入和查询页大小均由 `api` 配置限制。
@@ -33,7 +33,7 @@
 }
 ```
 
-`device_timestamp_raw` 必须是带 `Z` 或明确 UTC offset 的 RFC3339 时间。服务端原样保存该字符串，同时保存解析后的 `device_time_utc` 和服务端 `received_at_utc`。`clock_offset_ms = server_utc - device_utc`，`clock_error_ms` 必须非负。
+`device_timestamp_raw` 必须是带 `Z` 或明确 UTC offset 的 RFC3339 时间；`-00:00` 表示 offset 未知，因此必须拒绝，`Z` 和 `+00:00` 均可接受。服务端原样保存该字符串，同时保存解析后的 `device_time_utc` 和服务端 `received_at_utc`。`clock_offset_ms = server_utc - device_utc`，`clock_error_ms` 必须非负。
 
 结构合法批次按输入顺序返回逐项结果：
 
