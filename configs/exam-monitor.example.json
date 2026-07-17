@@ -1,0 +1,15 @@
+{
+  "schema_version": 1,
+  "server": {
+    "listen_address": "127.0.0.1:47831",
+    "allow_non_loopback": false,
+    "read_header_timeout": "5s",
+    "shutdown_timeout": "10s"
+  },
+  "paths": {
+    "data_directory": "data"
+  },
+  "logging": {
+    "level": "info"
+  }
+}

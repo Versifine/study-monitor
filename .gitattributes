@@ -1,4 +1,6 @@
 * text=auto
+.gitattributes text eol=lf
+.gitignore text eol=lf
 
 # Repository text files
 *.md text eol=lf
@@ -14,6 +16,7 @@
 *.html text eol=lf
 *.yaml text eol=lf
 *.yml text eol=lf
+VERSION text eol=lf
 
 # Windows-native scripts
 *.ps1 text eol=crlf

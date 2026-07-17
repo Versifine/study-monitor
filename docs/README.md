@@ -5,8 +5,8 @@
 ## 当前状态
 
 - Version 1 设计审查已完成
-- Recorder Core 业务代码尚未开始
-- 当前下一步是创建文档 Git 基线，然后只执行 M0
+- M0 仓库与开发工具已完成；Recorder Core 业务写入尚未开始
+- M1 尚未开始，必须作为后续独立任务执行
 - 时间不是当前最高风险；质量门槛优先于日历日期，M6 的 14 天认证不能压缩
 
 ## 三条阅读路径
@@ -80,19 +80,7 @@
 
 ## 下一步
 
-1. 人工确认 Version 1 范围和风险排序。
-2. 将当前文档包创建为独立 Git 基线检查点。
-3. 使用 `codex-prompts/01_M0.txt` 单独开始 M0。
-4. M0 验收并创建检查点后停止，再决定是否开始 M1。
-
-建议的文档基线命令：
-
-```powershell
-git status
-git add .gitignore AGENTS.md README.md CHANGELOG.md docs codex-prompts
-git diff --cached --stat
-git diff --cached
-git commit -m "docs: 冻结 Version 1 设计基线"
-```
-
-执行提交前先阅读暂存 diff；本页只是给出建议，不授权 Codex 自动提交。
+1. 审查 M0 diff、测试、构建和 smoke 结果。
+2. 为 M0 创建独立 Git 检查点并停止。
+3. 只有在下一次明确任务中，才使用 `codex-prompts/02_M1.txt` 开始 M1。
+4. 不要把 M1 与媒体、ActivityWatch、前端或 AI 合并实现。

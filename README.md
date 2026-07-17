@@ -8,7 +8,7 @@
 
 - 当前日期：2026-07-18
 - 计划：2026 年 9 月开始进入持续备考节奏
-- 当前状态：Version 1 设计审查已完成，尚未进入 M0
+- 当前状态：M0（仓库与开发工具）已完成，M1 尚未开始
 - 冻结目标：Recorder Core 通过 M0-M6 后才成为正式依赖，不为赶日期压缩验收
 - 正式备考期间：只允许重启、回滚、关闭故障模块，不进行研究性调参和功能开发
 
@@ -36,8 +36,31 @@
 
 Version 1 的完整建议目录和模块边界见 [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)。不预建分析、模型或微服务目录。
 
-当前文档包只冻结目标和约束，不代表业务代码已经实现。
+当前只实现 M0 基础骨架，不包含事件写入、SQLite、媒体、采集器、前端或 AI。
 
 ## 你现在应该做什么
 
-先把已经审查的文档创建为 Git 基线，然后把 [`codex-prompts/01_M0.txt`](codex-prompts/01_M0.txt) 作为下一次独立任务。不要同时开始 M1，也不需要先研究模型、摄像头或题库。
+先检查 M0 的测试、构建和 smoke 结果，然后停止。只有在单独确认后，才把 [`codex-prompts/02_M1.txt`](codex-prompts/02_M1.txt) 作为下一次任务；不要同时研究媒体、采集器或 AI。
+
+## M0 本地命令
+
+要求 Windows PowerShell 5.1 和 Go 1.25.4：
+
+```powershell
+.\scripts\dev.ps1 -Version
+.\scripts\dev.ps1 -Config .\configs\exam-monitor.example.json -CheckConfig
+.\scripts\test.ps1
+.\scripts\build.ps1
+.\scripts\smoke.ps1
+```
+
+默认仅监听 `127.0.0.1:47831`，运行数据目录默认为被 Git 忽略的 `data/`，只提供不依赖数据库的 `GET /health/live`。M0 不创建数据目录或写入业务数据。构建产物写入被 Git 忽略的 `bin/`。M0 只使用 Go 标准库，因此 `go.sum` 当前为空。
+
+配置优先级是安全默认值 → 可选 JSON 文件 → 环境变量。支持的环境变量：
+
+- `EXAM_MONITOR_LISTEN_ADDRESS`
+- `EXAM_MONITOR_ALLOW_NON_LOOPBACK`
+- `EXAM_MONITOR_DATA_DIRECTORY`
+- `EXAM_MONITOR_LOG_LEVEL`
+- `EXAM_MONITOR_READ_HEADER_TIMEOUT`
+- `EXAM_MONITOR_SHUTDOWN_TIMEOUT`
