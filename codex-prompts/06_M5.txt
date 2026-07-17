@@ -1,0 +1,13 @@
+完整阅读 AGENTS.md、docs/MASTER_SPEC.md 指定的 Recorder Core 全部文档、docs/DESIGN_REVIEW.md 和本提示。
+
+只实现 M5：最小只读仪表盘。
+
+开始前按 docs/MASTER_SPEC.md 汇报已读文件、范围、排除项和 record-only 保持方式，并列出预计修改文件与扩范围风险。
+
+只显示时间线、覆盖率、采集器状态、存储、积压和最近故障。
+
+不得加入复杂设计系统、实时 AI、可编辑计划或社交功能。
+
+完成后测试、审查并停止。
+
+docs/MILESTONES.md 的 M5 验收标准是完整完成线；本提示不得被用来缩减它。

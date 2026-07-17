@@ -1,0 +1,11 @@
+完整阅读 AGENTS.md、docs/MASTER_SPEC.md 指定的 Recorder Core 全部文档、docs/DESIGN_REVIEW.md 和本提示。
+
+只实现 M0：仓库与开发工具。
+
+开始前按 docs/MASTER_SPEC.md 汇报已读文件、范围、排除项和 record-only 保持方式，并列出预计修改文件与扩范围风险。不得实现事件写入、媒体登记或 AI。
+
+要求：Go 模块、版本化 JSON 配置验证、结构化日志、版本信息、PowerShell dev/test/build/smoke 脚本、测试骨架、Windows 原生运行、依赖固定。
+
+完成后运行全部测试和 smoke test，审查 diff，更新文档并停止。
+
+docs/MILESTONES.md 的 M0 验收标准是完整完成线；本提示不得被用来缩减它。

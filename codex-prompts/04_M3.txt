@@ -1,0 +1,13 @@
+完整阅读 AGENTS.md、docs/MASTER_SPEC.md 指定的 Recorder Core 全部文档、docs/DESIGN_REVIEW.md 和本提示。
+
+只实现 M3：采集器适配和统一时间线。
+
+开始前按 docs/MASTER_SPEC.md 汇报已读文件、范围、排除项和 record-only 保持方式，并列出预计修改文件与扩范围风险。
+
+实现 ActivityWatch 兼容适配器、通用 JSON 适配器、采集器心跳、时钟偏移元数据、覆盖率、缺口计算和时间线查询。
+
+不得开发键盘记录器，不记录密码和原始按键。
+
+使用固定测试数据。完成后测试、审查并停止。
+
+docs/MILESTONES.md 的 M3 验收标准是完整完成线；本提示不得被用来缩减它。

@@ -1,0 +1,11 @@
+完整阅读 AGENTS.md、docs/MASTER_SPEC.md 指定的 Recorder Core 全部文档、docs/DESIGN_REVIEW.md 和本提示。
+
+只实现 M4：自动恢复、保留、备份、恢复和回滚。
+
+开始前按 docs/MASTER_SPEC.md 汇报已读文件、范围、排除项和 record-only 保持方式，并列出预计修改文件与扩范围风险。
+
+要求当前用户 Windows Task Scheduler 托管、模块隔离、有界重试、本地缓冲、磁盘紧急保护、可验证备份、恢复演练、上一稳定版本回滚。
+
+所有脚本默认非破坏性。完成后故障注入测试、审查并停止。
+
+docs/MILESTONES.md 的 M4 验收标准是完整完成线；本提示不得被用来缩减它。

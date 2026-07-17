@@ -1,0 +1,13 @@
+完整阅读 AGENTS.md、docs/MASTER_SPEC.md 指定的 Recorder Core 全部文档、docs/DESIGN_REVIEW.md 和本提示。
+
+只实现 M1：仅追加事件存储与本地 API。
+
+开始前按 docs/MASTER_SPEC.md 汇报已读文件、范围、排除项和 record-only 保持方式，并列出预计修改文件与扩范围风险。
+
+要求：SQLite WAL、迁移、UTC 与设备时间、时钟偏移、幂等键、批量写入、输入限制、健康接口、确定性分页。
+
+不得实现媒体上传、AI、掌握度或复杂认证。
+
+加入重复写入、重启、损坏输入和并发测试。完成后审查 diff 并停止。
+
+docs/MILESTONES.md 的 M1 验收标准是完整完成线；本提示不得被用来缩减它。
