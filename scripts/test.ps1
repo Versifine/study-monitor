@@ -5,6 +5,17 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 $repoRoot = Split-Path -Parent $PSScriptRoot
 
+function Restore-EnvironmentVariable {
+    param([string]$Name, [AllowNull()][string]$Value)
+
+    if ($null -eq $Value) {
+        Remove-Item "Env:$Name" -ErrorAction SilentlyContinue
+    }
+    else {
+        Set-Item "Env:$Name" $Value
+    }
+}
+
 function Invoke-Go {
     param([Parameter(ValueFromRemainingArguments = $true)][string[]]$Arguments)
 
@@ -14,6 +25,8 @@ function Invoke-Go {
     }
 }
 
+$oldGOTOOLCHAIN = $env:GOTOOLCHAIN
+$env:GOTOOLCHAIN = 'local'
 Push-Location $repoRoot
 try {
     $requiredGo = ((Select-String -Path 'go.mod' -Pattern '^go\s+(.+)$').Matches[0].Groups[1].Value).Trim()
@@ -39,5 +52,6 @@ try {
     Invoke-Go test -count=1 ./...
 }
 finally {
+    Restore-EnvironmentVariable -Name 'GOTOOLCHAIN' -Value $oldGOTOOLCHAIN
     Pop-Location
 }

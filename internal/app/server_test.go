@@ -61,6 +61,23 @@ func TestLivenessMethods(t *testing.T) {
 	}
 }
 
+func TestHTTPServerHasBoundedConnectionLifecycle(t *testing.T) {
+	server := newTestServer(t, &bytes.Buffer{})
+	httpServer := server.newHTTPServer()
+	if httpServer.ReadHeaderTimeout != 5*time.Second {
+		t.Fatalf("ReadHeaderTimeout = %s", httpServer.ReadHeaderTimeout)
+	}
+	if httpServer.ReadTimeout != 10*time.Second {
+		t.Fatalf("ReadTimeout = %s", httpServer.ReadTimeout)
+	}
+	if httpServer.WriteTimeout != 10*time.Second {
+		t.Fatalf("WriteTimeout = %s", httpServer.WriteTimeout)
+	}
+	if httpServer.IdleTimeout != 30*time.Second {
+		t.Fatalf("IdleTimeout = %s", httpServer.IdleTimeout)
+	}
+}
+
 func TestUnknownRouteIsNotFound(t *testing.T) {
 	server := newTestServer(t, &bytes.Buffer{})
 	recorder := httptest.NewRecorder()
@@ -77,7 +94,7 @@ func TestRunReportsOccupiedAddress(t *testing.T) {
 	}
 	defer listener.Close()
 
-	cfg := config.Default()
+	cfg := loadTestConfig(t)
 	cfg.Server.ListenAddress = listener.Addr().String()
 	logger, err := logging.New(&bytes.Buffer{}, "info", "test")
 	if err != nil {
@@ -127,7 +144,22 @@ func newTestServer(t *testing.T, output io.Writer) *Server {
 	if err != nil {
 		t.Fatal(err)
 	}
-	return NewServer(config.Default(), logger, version.Info{Version: "0.1.0-test"})
+	return NewServer(loadTestConfig(t), logger, version.Info{Version: "0.1.0-test"})
+}
+
+func loadTestConfig(t *testing.T) config.Config {
+	t.Helper()
+	localAppData := t.TempDir()
+	cfg, err := config.Load("", func(key string) (string, bool) {
+		if key == "LOCALAPPDATA" {
+			return localAppData, true
+		}
+		return "", false
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return cfg
 }
 
 func waitForLiveness(t *testing.T, url string) {

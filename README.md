@@ -54,7 +54,9 @@ Version 1 的完整建议目录和模块边界见 [`docs/ARCHITECTURE.md`](docs/
 .\scripts\smoke.ps1
 ```
 
-默认仅监听 `127.0.0.1:47831`，运行数据目录默认为被 Git 忽略的 `data/`，只提供不依赖数据库的 `GET /health/live`。M0 不创建数据目录或写入业务数据。构建产物写入被 Git 忽略的 `bin/`。M0 只使用 Go 标准库，因此 `go.sum` 当前为空。
+默认仅监听 `127.0.0.1:47831`，只提供不依赖数据库的 `GET /health/live`。生产默认数据目录稳定解析为 `%LOCALAPPDATA%\ExamMonitor\data`，不依赖启动工作目录；`dev.ps1` 显式改用仓库中被 Git 忽略的 `data/`。绝对路径可以显式配置，相对路径只能在应用数据根内解析。M0 不创建数据目录或写入业务数据。构建产物写入被 Git 忽略的 `bin/`。M0 只使用 Go 标准库，因此 `go.sum` 当前为空。
+
+PowerShell 脚本在首次调用 Go 前强制使用本机已安装工具链，不允许 `GOTOOLCHAIN=auto` 静默下载；退出后恢复调用者原有环境。HTTP 连接的 header、读取、写入和空闲阶段均有配置超时。
 
 配置优先级是安全默认值 → 可选 JSON 文件 → 环境变量。支持的环境变量：
 
@@ -63,4 +65,7 @@ Version 1 的完整建议目录和模块边界见 [`docs/ARCHITECTURE.md`](docs/
 - `EXAM_MONITOR_DATA_DIRECTORY`
 - `EXAM_MONITOR_LOG_LEVEL`
 - `EXAM_MONITOR_READ_HEADER_TIMEOUT`
+- `EXAM_MONITOR_READ_TIMEOUT`
+- `EXAM_MONITOR_WRITE_TIMEOUT`
+- `EXAM_MONITOR_IDLE_TIMEOUT`
 - `EXAM_MONITOR_SHUTDOWN_TIMEOUT`

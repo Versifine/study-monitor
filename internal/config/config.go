@@ -8,6 +8,7 @@ import (
 	"io"
 	"net"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -34,7 +35,12 @@ const (
 	EnvDataDirectory    = "EXAM_MONITOR_DATA_DIRECTORY"
 	EnvLogLevel         = "EXAM_MONITOR_LOG_LEVEL"
 	EnvReadHeader       = "EXAM_MONITOR_READ_HEADER_TIMEOUT"
+	EnvRead             = "EXAM_MONITOR_READ_TIMEOUT"
+	EnvWrite            = "EXAM_MONITOR_WRITE_TIMEOUT"
+	EnvIdle             = "EXAM_MONITOR_IDLE_TIMEOUT"
 	EnvShutdown         = "EXAM_MONITOR_SHUTDOWN_TIMEOUT"
+
+	envLocalAppData = "LOCALAPPDATA"
 )
 
 // LookupEnv matches os.LookupEnv and makes environment overrides deterministic in tests.
@@ -52,6 +58,9 @@ type ServerConfig struct {
 	ListenAddress    string `json:"listen_address"`
 	AllowNonLoopback bool   `json:"allow_non_loopback"`
 	ReadHeader       string `json:"read_header_timeout"`
+	Read             string `json:"read_timeout"`
+	Write            string `json:"write_timeout"`
+	Idle             string `json:"idle_timeout"`
 	Shutdown         string `json:"shutdown_timeout"`
 }
 
@@ -81,13 +90,16 @@ func ErrorCode(err error) string {
 	return CodeDecodeFailed
 }
 
-func Default() Config {
+func defaultConfig() Config {
 	return Config{
 		SchemaVersion: CurrentSchemaVersion,
 		Server: ServerConfig{
 			ListenAddress:    "127.0.0.1:47831",
 			AllowNonLoopback: false,
 			ReadHeader:       "5s",
+			Read:             "10s",
+			Write:            "10s",
+			Idle:             "30s",
 			Shutdown:         "10s",
 		},
 		Paths:   PathsConfig{DataDirectory: "data"},
@@ -98,7 +110,10 @@ func Default() Config {
 // Load applies defaults, an optional JSON file, then environment overrides.
 // It validates the final result without creating directories or other runtime state.
 func Load(path string, lookup LookupEnv) (Config, error) {
-	cfg := Default()
+	if lookup == nil {
+		lookup = os.LookupEnv
+	}
+	cfg := defaultConfig()
 	if path != "" {
 		raw, err := os.ReadFile(path)
 		if err != nil {
@@ -109,10 +124,10 @@ func Load(path string, lookup LookupEnv) (Config, error) {
 		}
 	}
 
-	if lookup == nil {
-		lookup = os.LookupEnv
-	}
 	if err := applyEnvironment(&cfg, lookup); err != nil {
+		return Config{}, err
+	}
+	if err := resolveDataDirectory(&cfg, lookup); err != nil {
 		return Config{}, err
 	}
 	if err := cfg.Validate(); err != nil {
@@ -174,9 +189,47 @@ func applyEnvironment(cfg *Config, lookup LookupEnv) error {
 	if value, ok := lookup(EnvReadHeader); ok {
 		cfg.Server.ReadHeader = value
 	}
+	if value, ok := lookup(EnvRead); ok {
+		cfg.Server.Read = value
+	}
+	if value, ok := lookup(EnvWrite); ok {
+		cfg.Server.Write = value
+	}
+	if value, ok := lookup(EnvIdle); ok {
+		cfg.Server.Idle = value
+	}
 	if value, ok := lookup(EnvShutdown); ok {
 		cfg.Server.Shutdown = value
 	}
+	return nil
+}
+
+func resolveDataDirectory(cfg *Config, lookup LookupEnv) error {
+	value := cfg.Paths.DataDirectory
+	if strings.TrimSpace(value) != value || value == "" || strings.ContainsRune(value, '\x00') {
+		return &Error{Code: CodeInvalidDataDir, Err: errors.New("paths.data_directory must be a non-empty filesystem path without surrounding whitespace")}
+	}
+
+	cleaned := filepath.Clean(value)
+	if filepath.IsAbs(cleaned) {
+		cfg.Paths.DataDirectory = cleaned
+		return nil
+	}
+	if !filepath.IsLocal(cleaned) {
+		return &Error{Code: CodeInvalidDataDir, Err: errors.New("relative paths.data_directory must be a local path within the application data root")}
+	}
+
+	localAppData, ok := lookup(envLocalAppData)
+	if !ok || strings.TrimSpace(localAppData) != localAppData || !filepath.IsAbs(localAppData) {
+		return &Error{Code: CodeInvalidDataDir, Err: errors.New("LOCALAPPDATA must provide an absolute application data root for relative paths")}
+	}
+	applicationRoot := filepath.Join(filepath.Clean(localAppData), "ExamMonitor")
+	resolved := filepath.Clean(filepath.Join(applicationRoot, cleaned))
+	relative, err := filepath.Rel(applicationRoot, resolved)
+	if err != nil || relative == ".." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
+		return &Error{Code: CodeInvalidDataDir, Err: errors.New("relative paths.data_directory must remain within the application data root")}
+	}
+	cfg.Paths.DataDirectory = resolved
 	return nil
 }
 
@@ -200,8 +253,8 @@ func (cfg Config) Validate() error {
 	if !ip.IsLoopback() && !cfg.Server.AllowNonLoopback {
 		return &Error{Code: CodeNonLoopback, Err: errors.New("non-loopback listen address requires server.allow_non_loopback=true")}
 	}
-	if strings.TrimSpace(cfg.Paths.DataDirectory) == "" || strings.ContainsRune(cfg.Paths.DataDirectory, '\x00') {
-		return &Error{Code: CodeInvalidDataDir, Err: errors.New("paths.data_directory must be a non-empty filesystem path")}
+	if !filepath.IsAbs(cfg.Paths.DataDirectory) {
+		return &Error{Code: CodeInvalidDataDir, Err: errors.New("paths.data_directory must resolve to an absolute filesystem path")}
 	}
 
 	switch strings.ToLower(cfg.Logging.Level) {
@@ -210,7 +263,21 @@ func (cfg Config) Validate() error {
 		return &Error{Code: CodeInvalidLogLevel, Err: errors.New("logging.level must be debug, info, warn, or error")}
 	}
 
-	if _, err := validateDuration("server.read_header_timeout", cfg.Server.ReadHeader); err != nil {
+	readHeaderTimeout, err := validateDuration("server.read_header_timeout", cfg.Server.ReadHeader)
+	if err != nil {
+		return err
+	}
+	readTimeout, err := validateDuration("server.read_timeout", cfg.Server.Read)
+	if err != nil {
+		return err
+	}
+	if readTimeout < readHeaderTimeout {
+		return &Error{Code: CodeInvalidTimeout, Err: errors.New("server.read_timeout must be greater than or equal to server.read_header_timeout")}
+	}
+	if _, err := validateDuration("server.write_timeout", cfg.Server.Write); err != nil {
+		return err
+	}
+	if _, err := validateDuration("server.idle_timeout", cfg.Server.Idle); err != nil {
 		return err
 	}
 	if _, err := validateDuration("server.shutdown_timeout", cfg.Server.Shutdown); err != nil {
@@ -232,6 +299,21 @@ func validateDuration(name, value string) (time.Duration, error) {
 
 func (cfg Config) ReadHeaderTimeout() time.Duration {
 	duration, _ := time.ParseDuration(cfg.Server.ReadHeader)
+	return duration
+}
+
+func (cfg Config) ReadTimeout() time.Duration {
+	duration, _ := time.ParseDuration(cfg.Server.Read)
+	return duration
+}
+
+func (cfg Config) WriteTimeout() time.Duration {
+	duration, _ := time.ParseDuration(cfg.Server.Write)
+	return duration
+}
+
+func (cfg Config) IdleTimeout() time.Duration {
+	duration, _ := time.ParseDuration(cfg.Server.Idle)
 	return duration
 }
 

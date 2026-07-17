@@ -68,10 +68,7 @@ func Run(ctx context.Context, cfg config.Config, logger *logging.Logger, build v
 
 // Serve accepts a listener so graceful shutdown can be tested without fixed ports.
 func (server *Server) Serve(ctx context.Context, listener net.Listener) error {
-	httpServer := &http.Server{
-		Handler:           server.handler,
-		ReadHeaderTimeout: server.config.ReadHeaderTimeout(),
-	}
+	httpServer := server.newHTTPServer()
 
 	server.logger.Info(
 		"app",
@@ -106,6 +103,16 @@ func (server *Server) Serve(ctx context.Context, listener net.Listener) error {
 		}
 		server.logger.Info("app", "stopped", "recorder core skeleton stopped")
 		return nil
+	}
+}
+
+func (server *Server) newHTTPServer() *http.Server {
+	return &http.Server{
+		Handler:           server.handler,
+		ReadHeaderTimeout: server.config.ReadHeaderTimeout(),
+		ReadTimeout:       server.config.ReadTimeout(),
+		WriteTimeout:      server.config.WriteTimeout(),
+		IdleTimeout:       server.config.IdleTimeout(),
 	}
 }
 

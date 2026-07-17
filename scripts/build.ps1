@@ -20,10 +20,12 @@ function Restore-EnvironmentVariable {
     }
 }
 
-Push-Location $repoRoot
+$oldGOTOOLCHAIN = $env:GOTOOLCHAIN
 $oldGOOS = $env:GOOS
 $oldGOARCH = $env:GOARCH
 $oldCGO = $env:CGO_ENABLED
+$env:GOTOOLCHAIN = 'local'
+Push-Location $repoRoot
 try {
     $requiredGo = ((Select-String -Path 'go.mod' -Pattern '^go\s+(.+)$').Matches[0].Groups[1].Value).Trim()
     $actualGo = ((& go env GOVERSION) | Out-String).Trim()
@@ -42,14 +44,11 @@ try {
     if ($LASTEXITCODE -ne 0 -or -not $commit) {
         throw 'Unable to determine Git commit'
     }
-    & git diff --quiet
-    $worktreeDiff = $LASTEXITCODE
-    & git diff --cached --quiet
-    $indexDiff = $LASTEXITCODE
-    if ($worktreeDiff -gt 1 -or $indexDiff -gt 1) {
+    $repositoryStatus = @(& git status --porcelain=v1 --untracked-files=all)
+    if ($LASTEXITCODE -ne 0) {
         throw 'Unable to determine Git worktree state'
     }
-    if ($worktreeDiff -eq 1 -or $indexDiff -eq 1) {
+    if ($repositoryStatus.Count -ne 0) {
         $commit = "$commit-dirty"
     }
 
@@ -81,6 +80,7 @@ try {
     Write-Output $binaryPath
 }
 finally {
+    Restore-EnvironmentVariable -Name 'GOTOOLCHAIN' -Value $oldGOTOOLCHAIN
     Restore-EnvironmentVariable -Name 'GOOS' -Value $oldGOOS
     Restore-EnvironmentVariable -Name 'GOARCH' -Value $oldGOARCH
     Restore-EnvironmentVariable -Name 'CGO_ENABLED' -Value $oldCGO

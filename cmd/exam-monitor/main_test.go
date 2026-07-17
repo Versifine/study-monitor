@@ -56,7 +56,8 @@ func TestRunCheckConfigDoesNotCreateRuntimeState(t *testing.T) {
 	if result["status"] != "ok" || result["listen_address"] != "127.0.0.1:47831" {
 		t.Fatalf("unexpected check result: %#v", result)
 	}
-	if result["data_directory"] != "data" {
+	wantDataDirectory := filepath.Join(testLocalAppData, "ExamMonitor", "data")
+	if result["data_directory"] != wantDataDirectory {
 		t.Fatalf("unexpected data directory: %#v", result["data_directory"])
 	}
 }
@@ -121,4 +122,11 @@ func directoryEntries(t *testing.T, path string) []string {
 	return names
 }
 
-func emptyEnvironment(string) (string, bool) { return "", false }
+var testLocalAppData = filepath.Join(os.TempDir(), "exam-monitor-main-test-local-app-data")
+
+func emptyEnvironment(key string) (string, bool) {
+	if key == "LOCALAPPDATA" {
+		return testLocalAppData, true
+	}
+	return "", false
+}

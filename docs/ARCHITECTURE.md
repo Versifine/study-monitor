@@ -143,7 +143,7 @@ Python 只可能出现在 Version 1 之后的可选、隔离分析进程中。Ve
 │  └─ media/
 ├─ docs/
 ├─ codex-prompts/
-└─ data/                        # 运行时目录，不提交 Git
+└─ data/                        # dev.ps1 的开发运行目录，不提交 Git
 ```
 
-Version 1 不创建 `analysis/`、`models/`、知识图谱服务或独立部署目录。未来确有里程碑时再增加，避免空接口演化成提前实现。
+Windows 生产默认数据根是 `%LOCALAPPDATA%\ExamMonitor`；相对数据目录以该稳定根为基准，不能随 Task Scheduler 或命令行的工作目录漂移。Version 1 不创建 `analysis/`、`models/`、知识图谱服务或独立部署目录。未来确有里程碑时再增加，避免空接口演化成提前实现。

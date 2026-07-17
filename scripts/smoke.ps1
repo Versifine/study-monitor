@@ -42,6 +42,9 @@ try {
             listen_address = "127.0.0.1:$port"
             allow_non_loopback = $false
             read_header_timeout = '2s'
+            read_timeout = '3s'
+            write_timeout = '3s'
+            idle_timeout = '5s'
             shutdown_timeout = '2s'
         }
         paths = [ordered]@{ data_directory = (Join-Path $temporaryRoot 'data') }
