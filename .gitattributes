@@ -9,6 +9,7 @@
 *.mod text eol=lf
 *.sum text eol=lf
 *.json text eol=lf
+*.sql text eol=lf
 *.ts text eol=lf
 *.tsx text eol=lf
 *.js text eol=lf

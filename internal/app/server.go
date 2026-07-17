@@ -2,7 +2,6 @@ package app
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -10,6 +9,8 @@ import (
 	"net/http"
 
 	"github.com/Versifine/study-monitor/internal/config"
+	"github.com/Versifine/study-monitor/internal/eventstore"
+	"github.com/Versifine/study-monitor/internal/httpapi"
 	"github.com/Versifine/study-monitor/internal/logging"
 	"github.com/Versifine/study-monitor/internal/version"
 )
@@ -19,7 +20,6 @@ const (
 	CodeServeFailed    = "APP_SERVE_FAILED"
 	CodeShutdownFailed = "APP_SHUTDOWN_FAILED"
 
-	serviceName = "exam-monitor"
 	runtimeMode = "record-only"
 )
 
@@ -46,12 +46,13 @@ type Server struct {
 	handler http.Handler
 }
 
-func NewServer(cfg config.Config, logger *logging.Logger, build version.Info) *Server {
-	server := &Server{config: cfg, logger: logger, version: build}
-	mux := http.NewServeMux()
-	mux.HandleFunc("/health/live", server.handleLiveness)
-	server.handler = mux
-	return server
+func NewServer(cfg config.Config, logger *logging.Logger, build version.Info, store httpapi.Store, failure httpapi.StorageFailure) *Server {
+	return &Server{
+		config:  cfg,
+		logger:  logger,
+		version: build,
+		handler: httpapi.New(cfg, logger, build, store, failure),
+	}
 }
 
 func (server *Server) Handler() http.Handler { return server.handler }
@@ -63,7 +64,34 @@ func Run(ctx context.Context, cfg config.Config, logger *logging.Logger, build v
 		return &Error{Code: CodeListenFailed, Err: fmt.Errorf("listen on configured address: %w", err)}
 	}
 	defer listener.Close()
-	return NewServer(cfg, logger, build).Serve(ctx, listener)
+
+	store, storeErr := eventstore.Open(ctx, cfg.DatabasePath(), eventstore.Options{
+		BusyTimeout: cfg.BusyTimeout(), MaxOpenConnections: cfg.Storage.MaxOpenConnections,
+		MaxBatchEvents: cfg.API.MaxBatchEvents, MaxEventBytes: cfg.API.MaxEventBytes,
+		MaxPayloadDepth: cfg.API.MaxPayloadDepth, MaxPageSize: cfg.API.MaxPageSize,
+	})
+	failure := httpapi.StorageFailure{}
+	if storeErr != nil {
+		failure = classifyStorageFailure(storeErr)
+		logger.Error("storage", "initialization_failed", failure.ErrorCode, "event storage initialization failed", storeErr)
+	} else {
+		defer store.Close()
+	}
+	return NewServer(cfg, logger, build, store, failure).Serve(ctx, listener)
+}
+
+func classifyStorageFailure(err error) httpapi.StorageFailure {
+	code := eventstore.ErrorCode(err)
+	status := eventstore.ReadinessUnavailable
+	switch code {
+	case eventstore.CodeMigrationFailed, eventstore.CodeMigrationUnsupported:
+		status = eventstore.ReadinessMigrationFailed
+	case eventstore.CodeReadOnly:
+		status = eventstore.ReadinessReadOnly
+	case eventstore.CodeBusy:
+		status = eventstore.ReadinessBusy
+	}
+	return httpapi.StorageFailure{Status: status, ErrorCode: code}
 }
 
 // Serve accepts a listener so graceful shutdown can be tested without fixed ports.
@@ -73,7 +101,7 @@ func (server *Server) Serve(ctx context.Context, listener net.Listener) error {
 	server.logger.Info(
 		"app",
 		"started",
-		"recorder core skeleton started",
+		"recorder core started",
 		slog.String("listen_address", listener.Addr().String()),
 		slog.String("mode", runtimeMode),
 	)
@@ -88,7 +116,7 @@ func (server *Server) Serve(ctx context.Context, listener net.Listener) error {
 		if err != nil && !errors.Is(err, http.ErrServerClosed) {
 			return &Error{Code: CodeServeFailed, Err: fmt.Errorf("serve liveness endpoint: %w", err)}
 		}
-		server.logger.Info("app", "stopped", "recorder core skeleton stopped")
+		server.logger.Info("app", "stopped", "recorder core stopped")
 		return nil
 	case <-ctx.Done():
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), server.config.ShutdownTimeout())
@@ -101,7 +129,7 @@ func (server *Server) Serve(ctx context.Context, listener net.Listener) error {
 		if err != nil && !errors.Is(err, http.ErrServerClosed) {
 			return &Error{Code: CodeServeFailed, Err: fmt.Errorf("serve liveness endpoint: %w", err)}
 		}
-		server.logger.Info("app", "stopped", "recorder core skeleton stopped")
+		server.logger.Info("app", "stopped", "recorder core stopped")
 		return nil
 	}
 }
@@ -114,31 +142,4 @@ func (server *Server) newHTTPServer() *http.Server {
 		WriteTimeout:      server.config.WriteTimeout(),
 		IdleTimeout:       server.config.IdleTimeout(),
 	}
-}
-
-func (server *Server) handleLiveness(writer http.ResponseWriter, request *http.Request) {
-	writer.Header().Set("Cache-Control", "no-store")
-	writer.Header().Set("Content-Type", "application/json; charset=utf-8")
-	if request.Method != http.MethodGet && request.Method != http.MethodHead {
-		writer.Header().Set("Allow", "GET, HEAD")
-		writer.WriteHeader(http.StatusMethodNotAllowed)
-		_ = json.NewEncoder(writer).Encode(map[string]string{"status": "method_not_allowed"})
-		return
-	}
-
-	writer.WriteHeader(http.StatusOK)
-	if request.Method == http.MethodHead {
-		return
-	}
-	_ = json.NewEncoder(writer).Encode(struct {
-		Status  string `json:"status"`
-		Service string `json:"service"`
-		Version string `json:"version"`
-		Mode    string `json:"mode"`
-	}{
-		Status:  "ok",
-		Service: serviceName,
-		Version: server.version.Version,
-		Mode:    runtimeMode,
-	})
 }

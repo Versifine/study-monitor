@@ -23,9 +23,10 @@
 - `idempotency_key`
 - `payload_json`
 - `payload_hash`
+- `content_hash`
 - `schema_version`
 
-幂等唯一范围是 `(collector_id, idempotency_key)`。同键同 `payload_hash` 是成功重放；同键不同内容是冲突，不得覆盖。
+幂等唯一范围是 `(collector_id, idempotency_key)`。`payload_hash` 是 payload 的规范化 SHA-256；`content_hash` 覆盖全部不可变事件字段和 `payload_hash`，但不包含服务端接收时间。同键同 `content_hash` 是成功重放并返回原事件 ID；同键不同内容是冲突，不得覆盖。
 
 ### collector_heartbeats
 

@@ -12,6 +12,19 @@
   "paths": {
     "data_directory": "data"
   },
+  "storage": {
+    "busy_timeout": "5s",
+    "max_open_connections": 8
+  },
+  "api": {
+    "max_request_bytes": 1048576,
+    "max_batch_events": 100,
+    "max_event_bytes": 65536,
+    "max_payload_depth": 16,
+    "max_concurrent_writes": 4,
+    "default_page_size": 100,
+    "max_page_size": 500
+  },
   "logging": {
     "level": "info"
   }

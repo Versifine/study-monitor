@@ -5,8 +5,8 @@
 ## 当前状态
 
 - Version 1 设计审查已完成
-- M0 仓库与开发工具已完成；Recorder Core 业务写入尚未开始
-- M1 尚未开始，必须作为后续独立任务执行
+- M0 仓库与开发工具、M1 仅追加事件存储与本地 API 已完成
+- M2 尚未开始，必须作为后续独立任务执行
 - 时间不是当前最高风险；质量门槛优先于日历日期，M6 的 14 天认证不能压缩
 
 ## 三条阅读路径
@@ -38,6 +38,7 @@
 | [`V1_FREEZE_SPEC.md`](V1_FREEZE_SPEC.md) | Version 1 范围、模式和冻结完成线 |
 | [`ARCHITECTURE.md`](ARCHITECTURE.md) | 单体架构、模块边界和建议目录 |
 | [`DATA_MODEL.md`](DATA_MODEL.md) | 追加事实、投影、时间和版本规则 |
+| [`API.md`](API.md) | M1 本地事件写入、查询和健康接口合同 |
 | [`EVIDENCE_AND_INFERENCE.md`](EVIDENCE_AND_INFERENCE.md) | Evidence/Observation/Inference 分层边界 |
 | [`MILESTONES.md`](MILESTONES.md) | M0-M6 范围、排除项和验收标准 |
 
@@ -80,7 +81,7 @@
 
 ## 下一步
 
-1. 审查 M0 diff、测试、构建和 smoke 结果。
-2. 为 M0 创建独立 Git 检查点并停止。
-3. 只有在下一次明确任务中，才使用 `codex-prompts/02_M1.txt` 开始 M1。
-4. 不要把 M1 与媒体、ActivityWatch、前端或 AI 合并实现。
+1. 审查 M1 diff、测试、构建和 smoke 结果。
+2. 为 M1 创建独立 Git 检查点并停止。
+3. 只有在下一次明确任务中，才使用 `codex-prompts/03_M2.txt` 开始 M2。
+4. 不要提前进入 ActivityWatch、媒体、覆盖率、前端或 AI。

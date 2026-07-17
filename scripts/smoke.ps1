@@ -4,11 +4,14 @@ param()
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 $repoRoot = Split-Path -Parent $PSScriptRoot
-$temporaryRoot = Join-Path ([IO.Path]::GetTempPath()) ("exam-monitor smoke-" + [guid]::NewGuid().ToString('N'))
+$temporaryRoot = Join-Path ([IO.Path]::GetTempPath()) ("exam-monitor m1-smoke-" + [guid]::NewGuid().ToString('N'))
 $buildDirectory = Join-Path $temporaryRoot 'bin'
 $configPath = Join-Path $temporaryRoot 'config.json'
-$stdoutPath = Join-Path $temporaryRoot 'stdout.log'
-$stderrPath = Join-Path $temporaryRoot 'stderr.log'
+$dataDirectory = Join-Path $temporaryRoot 'data'
+$firstStdout = Join-Path $temporaryRoot 'first-stdout.log'
+$firstStderr = Join-Path $temporaryRoot 'first-stderr.log'
+$secondStdout = Join-Path $temporaryRoot 'second-stdout.log'
+$secondStderr = Join-Path $temporaryRoot 'second-stderr.log'
 $process = $null
 
 function Get-FreeLoopbackPort {
@@ -28,6 +31,76 @@ function Write-Utf8WithoutBOM {
     [IO.File]::WriteAllText($Path, $Contents, (New-Object Text.UTF8Encoding($false)))
 }
 
+function Start-MonitorProcess {
+    param(
+        [string]$BinaryPath,
+        [string]$ConfigurationPath,
+        [string]$StandardOutput,
+        [string]$StandardError,
+        [string]$RunFor
+    )
+
+    $configArgument = '--config="' + $ConfigurationPath + '"'
+    return Start-Process -FilePath $BinaryPath `
+        -ArgumentList @($configArgument, "--run-for=$RunFor") `
+        -RedirectStandardOutput $StandardOutput `
+        -RedirectStandardError $StandardError `
+        -WindowStyle Hidden `
+        -PassThru
+}
+
+function Wait-ForReadiness {
+    param([Diagnostics.Process]$MonitorProcess, [string]$BaseURL)
+
+    $deadline = [DateTime]::UtcNow.AddSeconds(5)
+    while ([DateTime]::UtcNow -lt $deadline) {
+        if ($MonitorProcess.HasExited) {
+            break
+        }
+        try {
+            $response = Invoke-RestMethod -Uri "$BaseURL/health/ready" -Method Get -TimeoutSec 1
+            if ($response.status -eq 'writable' -and $response.schema_version -eq 1) {
+                return $response
+            }
+        }
+        catch {
+            Start-Sleep -Milliseconds 100
+        }
+    }
+    throw 'writable readiness endpoint did not become available'
+}
+
+function Invoke-EventBatch {
+    param([string]$BaseURL, [object[]]$Events)
+
+    $body = [ordered]@{ schema_version = 1; events = $Events } | ConvertTo-Json -Depth 10
+    return Invoke-RestMethod -Uri "$BaseURL/api/v1/events/batch" -Method Post -ContentType 'application/json' -Body $body -TimeoutSec 3
+}
+
+function Assert-CleanProcessStop {
+    param([Diagnostics.Process]$MonitorProcess, [string]$StandardError)
+
+    if (-not $MonitorProcess.WaitForExit(15000)) {
+        throw 'exam-monitor did not exit within the smoke timeout'
+    }
+    $records = @()
+    foreach ($line in @(Get-Content -LiteralPath $StandardError -Encoding UTF8)) {
+        if ($line.Trim()) {
+            $records += $line | ConvertFrom-Json
+        }
+    }
+    if (-not ($records.event -contains 'started') -or -not ($records.event -contains 'stopped')) {
+        throw 'structured logs do not contain both started and stopped events'
+    }
+    foreach ($record in $records) {
+        foreach ($field in @('time', 'level', 'service', 'build_version', 'component', 'event')) {
+            if (-not $record.PSObject.Properties[$field]) {
+                throw "structured log missing $field"
+            }
+        }
+    }
+}
+
 try {
     [void](New-Item -ItemType Directory -Path $temporaryRoot)
     $binaryPath = ((& (Join-Path $PSScriptRoot 'build.ps1') -OutputDirectory $buildDirectory) | Select-Object -Last 1)
@@ -36,6 +109,7 @@ try {
     }
 
     $port = Get-FreeLoopbackPort
+    $baseURL = "http://127.0.0.1:$port"
     $config = [ordered]@{
         schema_version = 1
         server = [ordered]@{
@@ -47,98 +121,99 @@ try {
             idle_timeout = '5s'
             shutdown_timeout = '2s'
         }
-        paths = [ordered]@{ data_directory = (Join-Path $temporaryRoot 'data') }
+        paths = [ordered]@{ data_directory = $dataDirectory }
+        storage = [ordered]@{ busy_timeout = '1s'; max_open_connections = 4 }
+        api = [ordered]@{
+            max_request_bytes = 1048576
+            max_batch_events = 100
+            max_event_bytes = 65536
+            max_payload_depth = 16
+            max_concurrent_writes = 4
+            default_page_size = 100
+            max_page_size = 500
+        }
         logging = [ordered]@{ level = 'info' }
     }
-    Write-Utf8WithoutBOM -Path $configPath -Contents ($config | ConvertTo-Json -Depth 4)
+    Write-Utf8WithoutBOM -Path $configPath -Contents ($config | ConvertTo-Json -Depth 6)
 
     $checkJSON = ((& $binaryPath "--config=$configPath" --check-config) | Out-String).Trim()
     if ($LASTEXITCODE -ne 0) {
         throw "--check-config failed with exit code $LASTEXITCODE"
     }
     $check = $checkJSON | ConvertFrom-Json
-    if ($check.status -ne 'ok' -or $check.listen_address -ne "127.0.0.1:$port" -or $check.data_directory -ne (Join-Path $temporaryRoot 'data')) {
+    $expectedDatabase = Join-Path $dataDirectory 'exam-monitor.db'
+    if ($check.status -ne 'ok' -or $check.data_directory -ne $dataDirectory -or $check.database_path -ne $expectedDatabase) {
         throw "unexpected --check-config output: $checkJSON"
     }
-    if (Test-Path -LiteralPath $check.data_directory) {
+    if (Test-Path -LiteralPath $dataDirectory) {
         throw '--check-config created the runtime data directory'
     }
 
-    $startConfigArgument = '--config="' + $configPath + '"'
-    $process = Start-Process -FilePath $binaryPath `
-        -ArgumentList @($startConfigArgument, '--run-for=4s') `
-        -RedirectStandardOutput $stdoutPath `
-        -RedirectStandardError $stderrPath `
-        -WindowStyle Hidden `
-        -PassThru
+    $process = Start-MonitorProcess -BinaryPath $binaryPath -ConfigurationPath $configPath -StandardOutput $firstStdout -StandardError $firstStderr -RunFor '8s'
+    [void](Wait-ForReadiness -MonitorProcess $process -BaseURL $baseURL)
 
-    $health = $null
-    $deadline = [DateTime]::UtcNow.AddSeconds(3)
-    while ([DateTime]::UtcNow -lt $deadline -and -not $health) {
-        if ($process.HasExited) {
-            break
-        }
-        try {
-            $health = Invoke-RestMethod -Uri "http://127.0.0.1:$port/health/live" -Method Get -TimeoutSec 1
-        }
-        catch {
-            Start-Sleep -Milliseconds 100
-        }
+    $event = [ordered]@{
+        schema_version = 1
+        collector_id = 'smoke.desktop'
+        event_type = 'study.activity'
+        device_timestamp_raw = '2026-07-18T10:00:00+08:00'
+        clock_offset_ms = 125
+        clock_error_ms = 50
+        idempotency_key = 'm1-smoke-event-1'
+        payload = [ordered]@{ window = 'notes'; seconds = 42 }
     }
-    if (-not $health) {
-        throw 'liveness endpoint did not become available'
+    $accepted = Invoke-EventBatch -BaseURL $baseURL -Events @($event)
+    if ($accepted.schema_version -ne 1 -or $accepted.results[0].status -ne 'accepted' -or $accepted.results[0].event_id -le 0) {
+        throw "unexpected accepted response: $($accepted | ConvertTo-Json -Depth 6 -Compress)"
     }
-    if ($health.status -ne 'ok' -or $health.service -ne 'exam-monitor' -or $health.mode -ne 'record-only') {
-        throw "unexpected liveness response: $($health | ConvertTo-Json -Compress)"
+    $eventID = $accepted.results[0].event_id
+
+    $duplicate = Invoke-EventBatch -BaseURL $baseURL -Events @($event)
+    if ($duplicate.results[0].status -ne 'duplicate' -or $duplicate.results[0].event_id -ne $eventID) {
+        throw "unexpected duplicate response: $($duplicate | ConvertTo-Json -Depth 6 -Compress)"
     }
 
-    if (-not $process.WaitForExit(10000)) {
-        throw 'exam-monitor did not exit within the smoke timeout'
+    $conflictingEvent = [ordered]@{
+        schema_version = 1
+        collector_id = 'smoke.desktop'
+        event_type = 'study.activity'
+        device_timestamp_raw = '2026-07-18T10:00:00+08:00'
+        clock_offset_ms = 125
+        clock_error_ms = 50
+        idempotency_key = 'm1-smoke-event-1'
+        payload = [ordered]@{ window = 'different'; seconds = 42 }
     }
-    if (-not $process.HasExited) {
-        throw 'exam-monitor remained running after the smoke timeout'
-    }
-
-    $logRecords = @()
-    foreach ($line in @(Get-Content -LiteralPath $stderrPath -Encoding UTF8)) {
-        if ($line.Trim()) {
-            $logRecords += $line | ConvertFrom-Json
-        }
-    }
-    if ($logRecords.Count -lt 2) {
-        throw "expected startup and shutdown logs, got $($logRecords.Count)"
-    }
-    foreach ($record in $logRecords) {
-        foreach ($field in @('time', 'level', 'service', 'build_version', 'component', 'event')) {
-            if (-not $record.PSObject.Properties[$field]) {
-                throw "structured log missing $field"
-            }
-        }
-    }
-    if (-not ($logRecords.event -contains 'started') -or -not ($logRecords.event -contains 'stopped')) {
-        throw 'structured logs do not contain both started and stopped events'
+    $conflict = Invoke-EventBatch -BaseURL $baseURL -Events @($conflictingEvent)
+    if ($conflict.results[0].status -ne 'conflict' -or $conflict.results[0].event_id -ne $eventID) {
+        throw "unexpected conflict response: $($conflict | ConvertTo-Json -Depth 6 -Compress)"
     }
 
-    # Start-Process on Windows PowerShell 5.1 does not reliably populate ExitCode.
-    # A short foreground run verifies the executable's actual clean exit code.
-    $previousErrorActionPreference = $ErrorActionPreference
-    try {
-        $ErrorActionPreference = 'Continue'
-        $cleanExitOutput = @(& $binaryPath "--config=$configPath" '--run-for=500ms' 2>&1)
-        $cleanExitCode = $LASTEXITCODE
+    $query = Invoke-RestMethod -Uri "$baseURL/api/v1/events?limit=10" -Method Get -TimeoutSec 3
+    if ($query.schema_version -ne 1 -or $query.events.Count -ne 1 -or $query.events[0].id -ne $eventID -or $query.events[0].payload.window -ne 'notes') {
+        throw "unexpected event query: $($query | ConvertTo-Json -Depth 8 -Compress)"
     }
-    finally {
-        $ErrorActionPreference = $previousErrorActionPreference
-    }
-    if ($cleanExitCode -ne 0) {
-        throw "foreground clean-exit check failed with code $cleanExitCode`: $($cleanExitOutput -join [Environment]::NewLine)"
-    }
+    Assert-CleanProcessStop -MonitorProcess $process -StandardError $firstStderr
+    $process = $null
 
-    Write-Output "M0 smoke passed on http://127.0.0.1:$port/health/live"
+    $process = Start-MonitorProcess -BinaryPath $binaryPath -ConfigurationPath $configPath -StandardOutput $secondStdout -StandardError $secondStderr -RunFor '4s'
+    [void](Wait-ForReadiness -MonitorProcess $process -BaseURL $baseURL)
+    $restartQuery = Invoke-RestMethod -Uri "$baseURL/api/v1/events?limit=10" -Method Get -TimeoutSec 3
+    if ($restartQuery.events.Count -ne 1 -or $restartQuery.events[0].id -ne $eventID -or $restartQuery.events[0].idempotency_key -ne 'm1-smoke-event-1') {
+        throw "confirmed event missing after restart: $($restartQuery | ConvertTo-Json -Depth 8 -Compress)"
+    }
+    Assert-CleanProcessStop -MonitorProcess $process -StandardError $secondStderr
+    $process = $null
+
+    if (-not (Test-Path -LiteralPath $expectedDatabase -PathType Leaf)) {
+        throw 'M1 smoke database was not created in the temporary data directory'
+    }
+    Write-Output "M1 smoke passed: write, replay, conflict, query, restart query ($baseURL)"
 }
 catch {
-    if (Test-Path -LiteralPath $stderrPath) {
-        Write-Warning ((Get-Content -Raw -LiteralPath $stderrPath -Encoding UTF8).Trim())
+    foreach ($logPath in @($firstStderr, $secondStderr)) {
+        if (Test-Path -LiteralPath $logPath) {
+            Write-Warning ((Get-Content -Raw -LiteralPath $logPath -Encoding UTF8).Trim())
+        }
     }
     throw
 }

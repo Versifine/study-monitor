@@ -27,16 +27,19 @@ if ($Config -and -not [IO.Path]::IsPathRooted($Config)) {
 
 $hadGOTOOLCHAIN = Test-Path 'Env:GOTOOLCHAIN'
 $oldGOTOOLCHAIN = $env:GOTOOLCHAIN
+$hadGOPROXY = Test-Path 'Env:GOPROXY'
+$oldGOPROXY = $env:GOPROXY
 $hadDataDirectory = Test-Path 'Env:EXAM_MONITOR_DATA_DIRECTORY'
 $oldDataDirectory = $env:EXAM_MONITOR_DATA_DIRECTORY
 $env:GOTOOLCHAIN = 'local'
+$env:GOPROXY = 'off'
 if (-not $hadDataDirectory) {
     $env:EXAM_MONITOR_DATA_DIRECTORY = Join-Path $repoRoot 'data'
 }
 
 Push-Location $repoRoot
 try {
-    $arguments = @('./cmd/exam-monitor')
+    $arguments = @('-mod=vendor', './cmd/exam-monitor')
     if ($Config) {
         $arguments += "--config=$Config"
     }
@@ -58,6 +61,7 @@ try {
 }
 finally {
     Restore-EnvironmentVariable -Name 'GOTOOLCHAIN' -WasPresent $hadGOTOOLCHAIN -Value $oldGOTOOLCHAIN
+    Restore-EnvironmentVariable -Name 'GOPROXY' -WasPresent $hadGOPROXY -Value $oldGOPROXY
     Restore-EnvironmentVariable -Name 'EXAM_MONITOR_DATA_DIRECTORY' -WasPresent $hadDataDirectory -Value $oldDataDirectory
     Pop-Location
 }

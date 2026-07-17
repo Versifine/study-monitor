@@ -33,6 +33,16 @@ func TestLoadDefaultsAreSafe(t *testing.T) {
 	if cfg.Logging.Level != "info" {
 		t.Fatalf("Log level = %q", cfg.Logging.Level)
 	}
+	if cfg.BusyTimeout() != 5*time.Second || cfg.Storage.MaxOpenConnections != 8 {
+		t.Fatalf("unsafe storage defaults: %+v", cfg.Storage)
+	}
+	if cfg.API.MaxRequestBytes != 1<<20 || cfg.API.MaxBatchEvents != 100 || cfg.API.MaxEventBytes != 64<<10 ||
+		cfg.API.MaxPayloadDepth != 16 || cfg.API.MaxConcurrentWrites != 4 || cfg.API.DefaultPageSize != 100 || cfg.API.MaxPageSize != 500 {
+		t.Fatalf("unsafe API defaults: %+v", cfg.API)
+	}
+	if cfg.DatabasePath() != filepath.Join(wantDataDirectory, "exam-monitor.db") {
+		t.Fatalf("DatabasePath = %q", cfg.DatabasePath())
+	}
 }
 
 func TestLoadPartialFileRetainsDefaults(t *testing.T) {
@@ -61,6 +71,15 @@ func TestLoadEnvironmentOverridesFile(t *testing.T) {
 		EnvWrite:            "6s",
 		EnvIdle:             "20s",
 		EnvShutdown:         "15s",
+		EnvBusyTimeout:      "2s",
+		EnvMaxOpenConns:     "6",
+		EnvMaxRequestBytes:  "2097152",
+		EnvMaxBatchEvents:   "50",
+		EnvMaxEventBytes:    "32768",
+		EnvMaxPayloadDepth:  "12",
+		EnvMaxWrites:        "3",
+		EnvDefaultPageSize:  "25",
+		EnvMaxPageSize:      "250",
 	})
 	cfg, err := Load(path, lookup)
 	if err != nil {
@@ -74,7 +93,10 @@ func TestLoadEnvironmentOverridesFile(t *testing.T) {
 	}
 	if cfg.Logging.Level != "warn" || cfg.ReadHeaderTimeout() != 3*time.Second ||
 		cfg.ReadTimeout() != 4*time.Second || cfg.WriteTimeout() != 6*time.Second ||
-		cfg.IdleTimeout() != 20*time.Second || cfg.ShutdownTimeout() != 15*time.Second {
+		cfg.IdleTimeout() != 20*time.Second || cfg.ShutdownTimeout() != 15*time.Second ||
+		cfg.BusyTimeout() != 2*time.Second || cfg.Storage.MaxOpenConnections != 6 ||
+		cfg.API.MaxRequestBytes != 2097152 || cfg.API.MaxBatchEvents != 50 || cfg.API.MaxEventBytes != 32768 ||
+		cfg.API.MaxPayloadDepth != 12 || cfg.API.MaxConcurrentWrites != 3 || cfg.API.DefaultPageSize != 25 || cfg.API.MaxPageSize != 250 {
 		t.Fatalf("environment override not applied: %+v", cfg)
 	}
 }
@@ -147,6 +169,11 @@ func TestLoadRejectsInvalidInput(t *testing.T) {
 		{name: "invalid level", json: `{"schema_version":1,"logging":{"level":"trace"}}`, code: CodeInvalidLogLevel},
 		{name: "short timeout", json: `{"schema_version":1,"server":{"shutdown_timeout":"10ms"}}`, code: CodeInvalidTimeout},
 		{name: "read timeout before header timeout", json: `{"schema_version":1,"server":{"read_header_timeout":"8s","read_timeout":"5s"}}`, code: CodeInvalidTimeout},
+		{name: "short busy timeout", json: `{"schema_version":1,"storage":{"busy_timeout":"10ms"}}`, code: CodeInvalidStorage},
+		{name: "too many database connections", json: `{"schema_version":1,"storage":{"max_open_connections":33}}`, code: CodeInvalidStorage},
+		{name: "small request limit", json: `{"schema_version":1,"api":{"max_request_bytes":1024}}`, code: CodeInvalidAPILimit},
+		{name: "event limit exceeds request", json: `{"schema_version":1,"api":{"max_request_bytes":65536,"max_event_bytes":65536}}`, code: CodeInvalidAPILimit},
+		{name: "page default exceeds maximum", json: `{"schema_version":1,"api":{"default_page_size":501,"max_page_size":500}}`, code: CodeInvalidAPILimit},
 	}
 
 	for _, test := range tests {

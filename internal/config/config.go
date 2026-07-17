@@ -25,6 +25,8 @@ const (
 	CodeInvalidAddress    = "CONFIG_ADDRESS_INVALID"
 	CodeNonLoopback       = "CONFIG_NON_LOOPBACK_DISABLED"
 	CodeInvalidDataDir    = "CONFIG_DATA_DIRECTORY_INVALID"
+	CodeInvalidStorage    = "CONFIG_STORAGE_INVALID"
+	CodeInvalidAPILimit   = "CONFIG_API_LIMIT_INVALID"
 	CodeInvalidLogLevel   = "CONFIG_LOG_LEVEL_INVALID"
 	CodeInvalidTimeout    = "CONFIG_TIMEOUT_INVALID"
 )
@@ -39,6 +41,15 @@ const (
 	EnvWrite            = "EXAM_MONITOR_WRITE_TIMEOUT"
 	EnvIdle             = "EXAM_MONITOR_IDLE_TIMEOUT"
 	EnvShutdown         = "EXAM_MONITOR_SHUTDOWN_TIMEOUT"
+	EnvBusyTimeout      = "EXAM_MONITOR_BUSY_TIMEOUT"
+	EnvMaxOpenConns     = "EXAM_MONITOR_MAX_OPEN_CONNECTIONS"
+	EnvMaxRequestBytes  = "EXAM_MONITOR_MAX_REQUEST_BYTES"
+	EnvMaxBatchEvents   = "EXAM_MONITOR_MAX_BATCH_EVENTS"
+	EnvMaxEventBytes    = "EXAM_MONITOR_MAX_EVENT_BYTES"
+	EnvMaxPayloadDepth  = "EXAM_MONITOR_MAX_PAYLOAD_DEPTH"
+	EnvMaxWrites        = "EXAM_MONITOR_MAX_CONCURRENT_WRITES"
+	EnvDefaultPageSize  = "EXAM_MONITOR_DEFAULT_PAGE_SIZE"
+	EnvMaxPageSize      = "EXAM_MONITOR_MAX_PAGE_SIZE"
 
 	envLocalAppData = "LOCALAPPDATA"
 )
@@ -46,11 +57,13 @@ const (
 // LookupEnv matches os.LookupEnv and makes environment overrides deterministic in tests.
 type LookupEnv func(string) (string, bool)
 
-// Config is the complete M0 configuration contract.
+// Config is the complete M1 configuration contract.
 type Config struct {
 	SchemaVersion int           `json:"schema_version"`
 	Server        ServerConfig  `json:"server"`
 	Paths         PathsConfig   `json:"paths"`
+	Storage       StorageConfig `json:"storage"`
+	API           APIConfig     `json:"api"`
 	Logging       LoggingConfig `json:"logging"`
 }
 
@@ -70,6 +83,21 @@ type LoggingConfig struct {
 
 type PathsConfig struct {
 	DataDirectory string `json:"data_directory"`
+}
+
+type StorageConfig struct {
+	BusyTimeout        string `json:"busy_timeout"`
+	MaxOpenConnections int    `json:"max_open_connections"`
+}
+
+type APIConfig struct {
+	MaxRequestBytes     int64 `json:"max_request_bytes"`
+	MaxBatchEvents      int   `json:"max_batch_events"`
+	MaxEventBytes       int   `json:"max_event_bytes"`
+	MaxPayloadDepth     int   `json:"max_payload_depth"`
+	MaxConcurrentWrites int   `json:"max_concurrent_writes"`
+	DefaultPageSize     int   `json:"default_page_size"`
+	MaxPageSize         int   `json:"max_page_size"`
 }
 
 // Error carries a stable error code without forcing callers to inspect text.
@@ -102,7 +130,20 @@ func defaultConfig() Config {
 			Idle:             "30s",
 			Shutdown:         "10s",
 		},
-		Paths:   PathsConfig{DataDirectory: "data"},
+		Paths: PathsConfig{DataDirectory: "data"},
+		Storage: StorageConfig{
+			BusyTimeout:        "5s",
+			MaxOpenConnections: 8,
+		},
+		API: APIConfig{
+			MaxRequestBytes:     1 << 20,
+			MaxBatchEvents:      100,
+			MaxEventBytes:       64 << 10,
+			MaxPayloadDepth:     16,
+			MaxConcurrentWrites: 4,
+			DefaultPageSize:     100,
+			MaxPageSize:         500,
+		},
 		Logging: LoggingConfig{Level: "info"},
 	}
 }
@@ -201,6 +242,37 @@ func applyEnvironment(cfg *Config, lookup LookupEnv) error {
 	if value, ok := lookup(EnvShutdown); ok {
 		cfg.Server.Shutdown = value
 	}
+	if value, ok := lookup(EnvBusyTimeout); ok {
+		cfg.Storage.BusyTimeout = value
+	}
+	integerOverrides := []struct {
+		name   string
+		target *int
+	}{
+		{name: EnvMaxOpenConns, target: &cfg.Storage.MaxOpenConnections},
+		{name: EnvMaxBatchEvents, target: &cfg.API.MaxBatchEvents},
+		{name: EnvMaxEventBytes, target: &cfg.API.MaxEventBytes},
+		{name: EnvMaxPayloadDepth, target: &cfg.API.MaxPayloadDepth},
+		{name: EnvMaxWrites, target: &cfg.API.MaxConcurrentWrites},
+		{name: EnvDefaultPageSize, target: &cfg.API.DefaultPageSize},
+		{name: EnvMaxPageSize, target: &cfg.API.MaxPageSize},
+	}
+	for _, override := range integerOverrides {
+		if value, ok := lookup(override.name); ok {
+			parsed, err := strconv.Atoi(value)
+			if err != nil {
+				return &Error{Code: CodeInvalidEnv, Err: fmt.Errorf("%s must be an integer", override.name)}
+			}
+			*override.target = parsed
+		}
+	}
+	if value, ok := lookup(EnvMaxRequestBytes); ok {
+		parsed, err := strconv.ParseInt(value, 10, 64)
+		if err != nil {
+			return &Error{Code: CodeInvalidEnv, Err: fmt.Errorf("%s must be an integer", EnvMaxRequestBytes)}
+		}
+		cfg.API.MaxRequestBytes = parsed
+	}
 	return nil
 }
 
@@ -283,6 +355,31 @@ func (cfg Config) Validate() error {
 	if _, err := validateDuration("server.shutdown_timeout", cfg.Server.Shutdown); err != nil {
 		return err
 	}
+	busyTimeout, err := time.ParseDuration(cfg.Storage.BusyTimeout)
+	if err != nil || busyTimeout < 100*time.Millisecond || busyTimeout > 30*time.Second {
+		return &Error{Code: CodeInvalidStorage, Err: errors.New("storage.busy_timeout must be between 100ms and 30s")}
+	}
+	if cfg.Storage.MaxOpenConnections < 1 || cfg.Storage.MaxOpenConnections > 32 {
+		return &Error{Code: CodeInvalidStorage, Err: errors.New("storage.max_open_connections must be between 1 and 32")}
+	}
+	if cfg.API.MaxRequestBytes < 64<<10 || cfg.API.MaxRequestBytes > 16<<20 {
+		return &Error{Code: CodeInvalidAPILimit, Err: errors.New("api.max_request_bytes must be between 65536 and 16777216")}
+	}
+	if cfg.API.MaxBatchEvents < 1 || cfg.API.MaxBatchEvents > 1000 {
+		return &Error{Code: CodeInvalidAPILimit, Err: errors.New("api.max_batch_events must be between 1 and 1000")}
+	}
+	if cfg.API.MaxEventBytes < 1024 || cfg.API.MaxEventBytes > 1<<20 || int64(cfg.API.MaxEventBytes) >= cfg.API.MaxRequestBytes {
+		return &Error{Code: CodeInvalidAPILimit, Err: errors.New("api.max_event_bytes must be between 1024 and 1048576 and below api.max_request_bytes")}
+	}
+	if cfg.API.MaxPayloadDepth < 1 || cfg.API.MaxPayloadDepth > 64 {
+		return &Error{Code: CodeInvalidAPILimit, Err: errors.New("api.max_payload_depth must be between 1 and 64")}
+	}
+	if cfg.API.MaxConcurrentWrites < 1 || cfg.API.MaxConcurrentWrites > 32 {
+		return &Error{Code: CodeInvalidAPILimit, Err: errors.New("api.max_concurrent_writes must be between 1 and 32")}
+	}
+	if cfg.API.DefaultPageSize < 1 || cfg.API.MaxPageSize < cfg.API.DefaultPageSize || cfg.API.MaxPageSize > 1000 {
+		return &Error{Code: CodeInvalidAPILimit, Err: errors.New("api page sizes must satisfy 1 <= default_page_size <= max_page_size <= 1000")}
+	}
 	return nil
 }
 
@@ -320,4 +417,13 @@ func (cfg Config) IdleTimeout() time.Duration {
 func (cfg Config) ShutdownTimeout() time.Duration {
 	duration, _ := time.ParseDuration(cfg.Server.Shutdown)
 	return duration
+}
+
+func (cfg Config) BusyTimeout() time.Duration {
+	duration, _ := time.ParseDuration(cfg.Storage.BusyTimeout)
+	return duration
+}
+
+func (cfg Config) DatabasePath() string {
+	return filepath.Join(cfg.Paths.DataDirectory, "exam-monitor.db")
 }

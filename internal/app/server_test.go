@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net"
 	"net/http"
@@ -12,6 +13,8 @@ import (
 	"time"
 
 	"github.com/Versifine/study-monitor/internal/config"
+	"github.com/Versifine/study-monitor/internal/eventstore"
+	"github.com/Versifine/study-monitor/internal/httpapi"
 	"github.com/Versifine/study-monitor/internal/logging"
 	"github.com/Versifine/study-monitor/internal/version"
 )
@@ -40,7 +43,7 @@ func TestLivenessEndpointIsInfrastructureOnly(t *testing.T) {
 	}
 	for _, forbidden := range []string{"ready", "database", "storage", "events"} {
 		if _, exists := response[forbidden]; exists {
-			t.Fatalf("M0 liveness leaked future readiness field %q", forbidden)
+			t.Fatalf("liveness leaked storage/readiness field %q", forbidden)
 		}
 	}
 }
@@ -109,6 +112,25 @@ func TestRunReportsOccupiedAddress(t *testing.T) {
 	}
 }
 
+func TestStorageInitializationFailureClassification(t *testing.T) {
+	tests := []struct {
+		code   string
+		status string
+	}{
+		{code: eventstore.CodeMigrationFailed, status: eventstore.ReadinessMigrationFailed},
+		{code: eventstore.CodeMigrationUnsupported, status: eventstore.ReadinessMigrationFailed},
+		{code: eventstore.CodeReadOnly, status: eventstore.ReadinessReadOnly},
+		{code: eventstore.CodeBusy, status: eventstore.ReadinessBusy},
+		{code: eventstore.CodeOpenFailed, status: eventstore.ReadinessUnavailable},
+	}
+	for _, test := range tests {
+		failure := classifyStorageFailure(&eventstore.Error{Code: test.code, Err: errors.New("test")})
+		if failure.Status != test.status || failure.ErrorCode != test.code {
+			t.Fatalf("classifyStorageFailure(%q) = %#v", test.code, failure)
+		}
+	}
+}
+
 func TestServeStopsCleanlyWhenContextIsCanceled(t *testing.T) {
 	var logs bytes.Buffer
 	server := newTestServer(t, &logs)
@@ -144,7 +166,7 @@ func newTestServer(t *testing.T, output io.Writer) *Server {
 	if err != nil {
 		t.Fatal(err)
 	}
-	return NewServer(loadTestConfig(t), logger, version.Info{Version: "0.1.0-test"})
+	return NewServer(loadTestConfig(t), logger, version.Info{Version: "0.1.0-test"}, nil, httpapi.StorageFailure{})
 }
 
 func loadTestConfig(t *testing.T) config.Config {

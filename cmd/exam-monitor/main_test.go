@@ -60,6 +60,9 @@ func TestRunCheckConfigDoesNotCreateRuntimeState(t *testing.T) {
 	if result["data_directory"] != wantDataDirectory {
 		t.Fatalf("unexpected data directory: %#v", result["data_directory"])
 	}
+	if result["database_path"] != filepath.Join(wantDataDirectory, "exam-monitor.db") {
+		t.Fatalf("unexpected database path: %#v", result["database_path"])
+	}
 }
 
 func TestRunInvalidConfigUsesStableStructuredError(t *testing.T) {

@@ -21,10 +21,12 @@ function Restore-EnvironmentVariable {
 }
 
 $oldGOTOOLCHAIN = $env:GOTOOLCHAIN
+$oldGOPROXY = $env:GOPROXY
 $oldGOOS = $env:GOOS
 $oldGOARCH = $env:GOARCH
 $oldCGO = $env:CGO_ENABLED
 $env:GOTOOLCHAIN = 'local'
+$env:GOPROXY = 'off'
 Push-Location $repoRoot
 try {
     $requiredGo = ((Select-String -Path 'go.mod' -Pattern '^go\s+(.+)$').Matches[0].Groups[1].Value).Trim()
@@ -63,7 +65,7 @@ try {
     $env:GOOS = 'windows'
     $env:GOARCH = 'amd64'
     $env:CGO_ENABLED = '0'
-    & go build -trimpath -buildvcs=false -ldflags $ldflags -o $binaryPath ./cmd/exam-monitor
+    & go build -mod=vendor -trimpath -buildvcs=false -ldflags $ldflags -o $binaryPath ./cmd/exam-monitor
     if ($LASTEXITCODE -ne 0) {
         throw "go build failed with exit code $LASTEXITCODE"
     }
@@ -81,6 +83,7 @@ try {
 }
 finally {
     Restore-EnvironmentVariable -Name 'GOTOOLCHAIN' -Value $oldGOTOOLCHAIN
+    Restore-EnvironmentVariable -Name 'GOPROXY' -Value $oldGOPROXY
     Restore-EnvironmentVariable -Name 'GOOS' -Value $oldGOOS
     Restore-EnvironmentVariable -Name 'GOARCH' -Value $oldGOARCH
     Restore-EnvironmentVariable -Name 'CGO_ENABLED' -Value $oldCGO

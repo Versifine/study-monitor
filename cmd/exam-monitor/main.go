@@ -82,12 +82,14 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer, lookup co
 			SchemaVersion int    `json:"schema_version"`
 			ListenAddress string `json:"listen_address"`
 			DataDirectory string `json:"data_directory"`
+			DatabasePath  string `json:"database_path"`
 			LogLevel      string `json:"log_level"`
 		}{
 			Status:        "ok",
 			SchemaVersion: cfg.SchemaVersion,
 			ListenAddress: cfg.Server.ListenAddress,
 			DataDirectory: cfg.Paths.DataDirectory,
+			DatabasePath:  cfg.DatabasePath(),
 			LogLevel:      cfg.Logging.Level,
 		}
 		if err := writeJSON(stdout, result); err != nil {
@@ -108,7 +110,7 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer, lookup co
 			"app",
 			"runtime_failed",
 			app.ErrorCode(err),
-			"recorder core skeleton stopped unexpectedly",
+			"recorder core stopped unexpectedly",
 			err,
 			slog.String("mode", "record-only"),
 		)

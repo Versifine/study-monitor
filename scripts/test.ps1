@@ -26,7 +26,9 @@ function Invoke-Go {
 }
 
 $oldGOTOOLCHAIN = $env:GOTOOLCHAIN
+$oldGOPROXY = $env:GOPROXY
 $env:GOTOOLCHAIN = 'local'
+$env:GOPROXY = 'off'
 Push-Location $repoRoot
 try {
     $requiredGo = ((Select-String -Path 'go.mod' -Pattern '^go\s+(.+)$').Matches[0].Groups[1].Value).Trim()
@@ -47,11 +49,12 @@ try {
         throw "Go files require formatting:`n$($unformatted -join [Environment]::NewLine)"
     }
 
-    Invoke-Go list -mod=readonly ./...
-    Invoke-Go vet ./...
-    Invoke-Go test -count=1 ./...
+    Invoke-Go list -mod=vendor ./...
+    Invoke-Go vet -mod=vendor ./...
+    Invoke-Go test -mod=vendor -count=1 ./...
 }
 finally {
     Restore-EnvironmentVariable -Name 'GOTOOLCHAIN' -Value $oldGOTOOLCHAIN
+    Restore-EnvironmentVariable -Name 'GOPROXY' -Value $oldGOPROXY
     Pop-Location
 }

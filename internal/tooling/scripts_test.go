@@ -47,9 +47,12 @@ func TestBuildScriptMarksUntrackedGoInputDirtyAndUsesLocalToolchain(t *testing.T
 	wrapper := writePowerShellWrapper(t, fmt.Sprintf(`
 $ErrorActionPreference = 'Stop'
 $env:GOTOOLCHAIN = 'invalid-unless-build-script-overrides-it'
+$env:GOPROXY = 'invalid-unless-build-script-overrides-it'
 $before = $env:GOTOOLCHAIN
+$beforeProxy = $env:GOPROXY
 $binary = (& '%s' -OutputDirectory '%s' | Select-Object -Last 1)
 if ($env:GOTOOLCHAIN -ne $before) { throw 'build.ps1 did not restore GOTOOLCHAIN' }
+if ($env:GOPROXY -ne $beforeProxy) { throw 'build.ps1 did not restore GOPROXY' }
 & $binary --version
 if ($LASTEXITCODE -ne 0) { throw 'built binary version check failed' }
 `, quotePowerShell(filepath.Join(fixture, "scripts", "build.ps1")), quotePowerShell(outputDirectory)))
@@ -72,12 +75,16 @@ func TestTestAndDevScriptsUseLocalToolchainAndRestoreEnvironment(t *testing.T) {
 	wrapper := writePowerShellWrapper(t, fmt.Sprintf(`
 $ErrorActionPreference = 'Stop'
 $env:GOTOOLCHAIN = 'invalid-unless-script-overrides-it'
+$env:GOPROXY = 'invalid-unless-script-overrides-it'
 $before = $env:GOTOOLCHAIN
+$beforeProxy = $env:GOPROXY
 $env:%s = '1'
 & '%s'
 if ($env:GOTOOLCHAIN -ne $before) { throw 'test.ps1 did not restore GOTOOLCHAIN' }
+if ($env:GOPROXY -ne $beforeProxy) { throw 'test.ps1 did not restore GOPROXY' }
 & '%s' -Version
 if ($env:GOTOOLCHAIN -ne $before) { throw 'dev.ps1 did not restore GOTOOLCHAIN' }
+if ($env:GOPROXY -ne $beforeProxy) { throw 'dev.ps1 did not restore GOPROXY' }
 `, nestedScriptTest, quotePowerShell(filepath.Join(repository, "scripts", "test.ps1")), quotePowerShell(filepath.Join(repository, "scripts", "dev.ps1"))))
 
 	runPowerShell(t, wrapper, nil)
@@ -86,7 +93,7 @@ if ($env:GOTOOLCHAIN -ne $before) { throw 'dev.ps1 did not restore GOTOOLCHAIN' 
 func requireOuterWindowsTest(t *testing.T) {
 	t.Helper()
 	if runtime.GOOS != "windows" {
-		t.Skip("M0 PowerShell contracts are Windows-specific")
+		t.Skip("PowerShell contracts are Windows-specific")
 	}
 	if os.Getenv(nestedScriptTest) != "" {
 		t.Skip("skip script recursion")
