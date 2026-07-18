@@ -66,6 +66,17 @@ type eventInput struct {
 	Payload            json.RawMessage `json:"payload"`
 }
 
+var eventInputJSONFields = []string{
+	"schema_version",
+	"collector_id",
+	"event_type",
+	"device_timestamp_raw",
+	"clock_offset_ms",
+	"clock_error_ms",
+	"idempotency_key",
+	"payload",
+}
+
 type preparedEvent struct {
 	SchemaVersion      int
 	CollectorID        string
@@ -199,8 +210,8 @@ func (store *Store) prepare(raw json.RawMessage, receivedAt string) (*preparedEv
 	if len(raw) > store.maxEventBytes {
 		return nil, &validationError{code: CodeEventTooLarge, err: errors.New("event exceeds configured byte limit")}
 	}
-	if err := strictjson.ValidateObjectKeys(raw, 0); err != nil {
-		return nil, &validationError{code: CodeEventDecodeInvalid, err: errors.New("event JSON contains a duplicate object key or is invalid")}
+	if err := strictjson.ValidateExactRootObject(raw, 0, eventInputJSONFields...); err != nil {
+		return nil, &validationError{code: CodeEventDecodeInvalid, err: errors.New("event JSON contains a duplicate or unexpected key, or is invalid")}
 	}
 	decoder := json.NewDecoder(bytes.NewReader(raw))
 	decoder.DisallowUnknownFields()

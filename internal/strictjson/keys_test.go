@@ -37,3 +37,41 @@ func TestValidateObjectKeys(t *testing.T) {
 		})
 	}
 }
+
+func TestValidateExactRootObject(t *testing.T) {
+	allowed := []string{"schema_version", "events"}
+	tests := []struct {
+		name       string
+		raw        string
+		depth      int
+		unexpected bool
+		valid      bool
+	}{
+		{name: "exact fields", raw: `{"schema_version":1,"events":[{"Payload":true}]}`, depth: 1, valid: true},
+		{name: "case variant", raw: `{"schema_version":1,"Events":[]}`, depth: 1, unexpected: true},
+		{name: "unknown field", raw: `{"schema_version":1,"events":[],"extra":true}`, depth: 1, unexpected: true},
+		{name: "nested arbitrary field", raw: `{"schema_version":1,"events":[{"Unknown":true}]}`, depth: 1, valid: true},
+		{name: "root array", raw: `[]`, depth: 1},
+		{name: "root scalar", raw: `true`, depth: 1},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			err := ValidateExactRootObject([]byte(test.raw), test.depth, allowed...)
+			if test.unexpected && !errors.Is(err, ErrUnexpectedObjectKey) {
+				t.Fatalf("error = %v, want unexpected key", err)
+			}
+			if test.valid && err != nil {
+				t.Fatalf("unexpected error = %v", err)
+			}
+			if !test.valid && !test.unexpected && err == nil {
+				t.Fatal("invalid root unexpectedly succeeded")
+			}
+		})
+	}
+	if err := ValidateExactRootObject([]byte(`{}`), 1); err != nil {
+		t.Fatalf("empty exact object = %v", err)
+	}
+	if err := ValidateExactRootObject([]byte(`{"unexpected":true}`), 1); !errors.Is(err, ErrUnexpectedObjectKey) {
+		t.Fatalf("zero-field schema error = %v, want unexpected key", err)
+	}
+}

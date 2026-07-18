@@ -34,6 +34,11 @@ const (
 	CodeStorageOffline   = "API_STORAGE_UNAVAILABLE"
 )
 
+var eventBatchEnvelopeJSONFields = []string{
+	"schema_version",
+	"events",
+}
+
 type Store interface {
 	AppendBatch(context.Context, []eventstore.Candidate) ([]eventstore.WriteResult, error)
 	QueryPage(context.Context, string, int) (eventstore.Page, error)
@@ -154,7 +159,7 @@ func (handler *Handler) handleEventBatch(writer http.ResponseWriter, request *ht
 		writeError(writer, request, http.StatusBadRequest, CodeJSONInvalid, "request JSON cannot be read")
 		return
 	}
-	if err := strictjson.ValidateObjectKeys(rawBody, 1); err != nil {
+	if err := strictjson.ValidateExactRootObject(rawBody, 1, eventBatchEnvelopeJSONFields...); err != nil {
 		writeError(writer, request, http.StatusBadRequest, CodeJSONInvalid, "request JSON is invalid")
 		return
 	}

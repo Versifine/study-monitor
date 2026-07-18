@@ -8,7 +8,10 @@ import (
 	"io"
 )
 
-var ErrDuplicateObjectKey = errors.New("JSON object contains a duplicate key")
+var (
+	ErrDuplicateObjectKey  = errors.New("JSON object contains a duplicate key")
+	ErrUnexpectedObjectKey = errors.New("JSON object contains an unexpected key")
+)
 
 type container struct {
 	delimiter json.Delim
@@ -21,6 +24,18 @@ type container struct {
 // depth are checked; zero checks every object. The full JSON value is always
 // parsed so malformed or trailing input cannot bypass the check.
 func ValidateObjectKeys(raw []byte, checkedContainerDepth int) error {
+	return validateObjectKeys(raw, checkedContainerDepth, nil, false)
+}
+
+// ValidateExactRootObject validates one JSON object, rejects duplicate keys to
+// the requested depth, and requires every root key to exactly match one of the
+// allowed keys. Matching is deliberately case-sensitive even though
+// encoding/json accepts case-insensitive struct field aliases.
+func ValidateExactRootObject(raw []byte, checkedContainerDepth int, allowedRootKeys ...string) error {
+	return validateObjectKeys(raw, checkedContainerDepth, allowedRootKeys, true)
+}
+
+func validateObjectKeys(raw []byte, checkedContainerDepth int, allowedRootKeys []string, exactRootObject bool) error {
 	decoder := json.NewDecoder(bytes.NewReader(raw))
 	decoder.UseNumber()
 	stack := make([]container, 0, 8)
@@ -61,8 +76,13 @@ func ValidateObjectKeys(raw []byte, checkedContainerDepth int) error {
 					if parent.delimiter == '{' && parent.expectKey {
 						return errors.New("JSON object key must be a string")
 					}
-				} else if rootValues != 0 {
-					return errors.New("JSON contains multiple root values")
+				} else {
+					if rootValues != 0 {
+						return errors.New("JSON contains multiple root values")
+					}
+					if exactRootObject && delimiter != '{' {
+						return errors.New("JSON root value must be an object")
+					}
 				}
 				entry := container{delimiter: delimiter, expectKey: delimiter == '{'}
 				depth := len(stack) + 1
@@ -101,9 +121,15 @@ func ValidateObjectKeys(raw []byte, checkedContainerDepth int) error {
 					}
 					current.keys[key] = struct{}{}
 				}
+				if len(stack) == 1 && exactRootObject && !containsExact(allowedRootKeys, key) {
+					return fmt.Errorf("%w: %q", ErrUnexpectedObjectKey, key)
+				}
 				current.expectKey = false
 				continue
 			}
+		}
+		if len(stack) == 0 && exactRootObject {
+			return errors.New("JSON root value must be an object")
 		}
 		if err := completeValue(); err != nil {
 			return err
@@ -117,6 +143,15 @@ func ValidateObjectKeys(raw []byte, checkedContainerDepth int) error {
 		return errors.New("JSON must contain exactly one value")
 	}
 	return nil
+}
+
+func containsExact(values []string, target string) bool {
+	for _, value := range values {
+		if value == target {
+			return true
+		}
+	}
+	return false
 }
 
 func matchingDelimiters(opening, closing json.Delim) bool {

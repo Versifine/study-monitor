@@ -191,6 +191,68 @@ func TestEventRejectsDuplicateKeysAtEveryObjectLevel(t *testing.T) {
 	assertEventCount(t, store.db, 0)
 }
 
+func TestEventRejectsCaseInsensitiveRootFieldAliases(t *testing.T) {
+	fields := []string{
+		"schema_version",
+		"collector_id",
+		"event_type",
+		"device_timestamp_raw",
+		"clock_offset_ms",
+		"clock_error_ms",
+		"idempotency_key",
+		"payload",
+	}
+	for _, field := range fields {
+		t.Run(field, func(t *testing.T) {
+			store := openTestStore(t, filepath.Join(t.TempDir(), "events.db"))
+			defer store.Close()
+			raw := strings.Replace(
+				string(testEvent("case-alias", "study.activity", `{}`)),
+				`"`+field+`":`,
+				`"`+strings.ToUpper(field)+`":`,
+				1,
+			)
+			results, err := store.AppendBatch(context.Background(), []Candidate{{Raw: json.RawMessage(raw)}})
+			if err != nil || len(results) != 1 || results[0].Status != StatusRejected || results[0].ErrorCode != CodeEventDecodeInvalid {
+				t.Fatalf("AppendBatch() = %#v, %v", results, err)
+			}
+			assertEventCount(t, store.db, 0)
+		})
+	}
+}
+
+func TestEventRejectsCaseVariantPayloadOverwrite(t *testing.T) {
+	store := openTestStore(t, filepath.Join(t.TempDir(), "events.db"))
+	defer store.Close()
+
+	raw := strings.Replace(
+		string(testEvent("payload-case-overwrite", "study.activity", `{"discarded":true}`)),
+		`"payload":{"discarded":true}`,
+		`"payload":{"discarded":true},"Payload":{"kept":true}`,
+		1,
+	)
+	results, err := store.AppendBatch(context.Background(), []Candidate{{Raw: json.RawMessage(raw)}})
+	if err != nil || len(results) != 1 || results[0].Status != StatusRejected || results[0].ErrorCode != CodeEventDecodeInvalid {
+		t.Fatalf("AppendBatch() = %#v, %v", results, err)
+	}
+	assertEventCount(t, store.db, 0)
+}
+
+func TestEventPayloadKeepsArbitraryCaseSensitiveKeys(t *testing.T) {
+	store := openTestStore(t, filepath.Join(t.TempDir(), "events.db"))
+	defer store.Close()
+
+	results, err := store.AppendBatch(context.Background(), []Candidate{{Raw: testEvent(
+		"payload-case-keys",
+		"study.activity",
+		`{"payload":1,"Payload":2,"IDEMPOTENCY_KEY":"opaque"}`,
+	)}})
+	if err != nil || len(results) != 1 || results[0].Status != StatusAccepted {
+		t.Fatalf("AppendBatch() = %#v, %v", results, err)
+	}
+	assertEventCount(t, store.db, 1)
+}
+
 func TestDeviceTimeRejectsUnknownNegativeZeroOffset(t *testing.T) {
 	store := openTestStore(t, filepath.Join(t.TempDir(), "events.db"))
 	defer store.Close()

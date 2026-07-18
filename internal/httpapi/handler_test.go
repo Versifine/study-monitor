@@ -111,6 +111,25 @@ func TestBatchEndpointRejectsDuplicateEnvelopeKeyWithoutWriting(t *testing.T) {
 	}
 }
 
+func TestBatchEndpointRejectsCaseVariantEnvelopeKeyWithoutWriting(t *testing.T) {
+	handler, store, _ := newIntegratedHandler(t)
+	defer store.Close()
+	first := testEventJSON("first", `{}`)
+	second := testEventJSON("second", `{}`)
+	body := fmt.Sprintf(`{"schema_version":1,"events":[%s],"Events":[%s]}`, first, second)
+	response := performJSON(handler, http.MethodPost, "/api/v1/events/batch", body, nil)
+	if response.Code != http.StatusBadRequest || responseErrorCode(t, response) != CodeJSONInvalid {
+		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+	}
+	page, err := store.QueryPage(context.Background(), "", 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(page.Events) != 0 {
+		t.Fatalf("case-variant envelope silently wrote events: %#v", page.Events)
+	}
+}
+
 func TestBatchEndpointRejectsDuplicateEventFieldIndependently(t *testing.T) {
 	handler, store, _ := newIntegratedHandler(t)
 	defer store.Close()
@@ -137,6 +156,36 @@ func TestBatchEndpointRejectsDuplicateEventFieldIndependently(t *testing.T) {
 		t.Fatal(err)
 	}
 	if len(page.Events) != 1 || page.Events[0].IdempotencyKey != "valid" {
+		t.Fatalf("stored events = %#v", page.Events)
+	}
+}
+
+func TestBatchEndpointRejectsCaseVariantEventFieldIndependently(t *testing.T) {
+	handler, store, _ := newIntegratedHandler(t)
+	defer store.Close()
+	caseVariant := strings.Replace(
+		testEventJSON("case-variant", `{}`),
+		`"idempotency_key":"case-variant"`,
+		`"idempotency_key":"discarded","IDEMPOTENCY_KEY":"case-variant"`,
+		1,
+	)
+	valid := testEventJSON("valid-after-case-variant", `{"kept":true}`)
+	body := fmt.Sprintf(`{"schema_version":1,"events":[%s,%s]}`, caseVariant, valid)
+	response := performJSON(handler, http.MethodPost, "/api/v1/events/batch", body, nil)
+	if response.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+	}
+	var result batchResponse
+	decodeResponse(t, response, &result)
+	if len(result.Results) != 2 || result.Results[0].Status != eventstore.StatusRejected ||
+		result.Results[0].ErrorCode != eventstore.CodeEventDecodeInvalid || result.Results[1].Status != eventstore.StatusAccepted {
+		t.Fatalf("results = %#v", result.Results)
+	}
+	page, err := store.QueryPage(context.Background(), "", 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(page.Events) != 1 || page.Events[0].IdempotencyKey != "valid-after-case-variant" {
 		t.Fatalf("stored events = %#v", page.Events)
 	}
 }
