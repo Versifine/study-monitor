@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"os"
 	"os/exec"
 	"strconv"
 	"strings"
@@ -46,6 +47,11 @@ func (prober ExecProber) Probe(ctx context.Context, mediaPath string, timeout ti
 		mediaPath,
 	)
 	if err != nil {
+		var execError *exec.Error
+		var pathError *os.PathError
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) || errors.As(err, &execError) || errors.As(err, &pathError) {
+			return ProbeInfo{}, &Error{Code: CodeProbeUnavailable, Err: errors.New("ffprobe cannot be executed reliably")}
+		}
 		return ProbeInfo{}, &Error{Code: CodeProbeFailed, Err: errors.New("ffprobe media validation failed")}
 	}
 	var response struct {

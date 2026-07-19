@@ -52,6 +52,14 @@ func TestDurationMillisecondsNeverRoundsDown(t *testing.T) {
 	}
 }
 
+func TestExecProberClassifiesMissingExecutableAsUnavailable(t *testing.T) {
+	prober := ExecProber{Path: filepath.Join(t.TempDir(), "missing-ffprobe")}
+	_, err := prober.Probe(context.Background(), filepath.Join(t.TempDir(), "media.mp4"), time.Second)
+	if ErrorCode(err) != CodeProbeUnavailable {
+		t.Fatalf("Probe() error = %v, want %s", err, CodeProbeUnavailable)
+	}
+}
+
 func requirePinnedFFprobe(t *testing.T) string {
 	t.Helper()
 	ffprobePath, err := exec.LookPath("ffprobe")

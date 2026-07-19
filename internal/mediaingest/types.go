@@ -72,6 +72,8 @@ type Repository interface {
 	AcceptMedia(context.Context, eventstore.MediaMetadata, eventstore.MediaIngestEvent, string) (eventstore.MediaClaim, error)
 	RebuildMediaProjections(context.Context) error
 	MediaIngestSummary(context.Context) (eventstore.MediaIngestSummary, error)
+	MediaFileCheckMatches(context.Context, string, string, string) (bool, error)
+	SaveMediaFileCheck(context.Context, string, string, string, string) error
 }
 
 type Prober interface {

@@ -18,6 +18,8 @@ func TestSidecarUsesExactSchemaAndUnambiguousTime(t *testing.T) {
 	}{
 		{name: "case alias", raw: strings.Replace(base, `"media_type":`, `"Media_Type":`, 1), code: CodeSidecarInvalid},
 		{name: "duplicate field", raw: strings.Replace(base, `"media_type":"video"`, `"media_type":"video","media_type":"video"`, 1), code: CodeSidecarInvalid},
+		{name: "missing complete", raw: strings.Replace(base, `"complete":true,`, "", 1), code: CodeSidecarInvalid},
+		{name: "null complete", raw: strings.Replace(base, `"complete":true`, `"complete":null`, 1), code: CodeSidecarInvalid},
 		{name: "unknown offset", raw: strings.Replace(base, "+08:00", "-00:00", 1), code: CodeTimeInvalid},
 		{name: "incomplete", raw: strings.Replace(base, `"complete":true`, `"complete":false`, 1), code: CodeSidecarIncomplete},
 		{name: "over ten minutes", raw: strings.Replace(base, "10:00:01", "10:11:00", 1), code: CodeTimeInvalid},

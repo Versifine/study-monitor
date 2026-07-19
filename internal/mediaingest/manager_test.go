@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -22,6 +23,24 @@ type fakeProber struct {
 	version string
 	info    ProbeInfo
 	err     error
+}
+
+type mutableProber struct {
+	version    string
+	probeError error
+	probeCalls int
+}
+
+func (prober *mutableProber) Version(context.Context, time.Duration) (string, error) {
+	return prober.version, nil
+}
+
+func (prober *mutableProber) Probe(context.Context, string, time.Duration) (ProbeInfo, error) {
+	prober.probeCalls++
+	if prober.probeError != nil {
+		return ProbeInfo{}, prober.probeError
+	}
+	return ProbeInfo{DurationMS: 1000, CodecName: "h264", FormatName: "mov,mp4", MediaType: "video"}, nil
 }
 
 func (prober fakeProber) Version(context.Context, time.Duration) (string, error) {
@@ -97,6 +116,45 @@ func TestManagerAcceptsReplaysAndPreservesSource(t *testing.T) {
 	}
 }
 
+func TestConfirmationSupportsCrossSourceContentReuse(t *testing.T) {
+	prober := &mutableProber{version: SupportedFFprobeVersion}
+	manager, store, cfg := openTestManager(t, prober)
+	defer store.Close()
+	contents := []byte(strings.Repeat("shared-content-", 100))
+	first := writeSegment(t, cfg.MediaIngest.InboxDirectory, "reuse-first.mp4", contents, nil)
+	second := writeSegment(t, cfg.MediaIngest.InboxDirectory, "reuse-second.mp4", contents, nil)
+	for _, readyPath := range []string{first.readyPath, second.readyPath} {
+		if accepted, err := manager.ProcessReady(context.Background(), readyPath); err != nil || !accepted {
+			t.Fatalf("ProcessReady(%s) = %t, %v", readyPath, accepted, err)
+		}
+	}
+	if prober.probeCalls != 2 {
+		t.Fatalf("initial probe calls = %d, want 2", prober.probeCalls)
+	}
+	if summary, err := store.MediaIngestSummary(context.Background()); err != nil || summary.TotalSegments != 1 {
+		t.Fatalf("content reuse summary = %#v, %v", summary, err)
+	}
+	if err := manager.ScanOnce(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.ScanOnce(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if status := manager.Status(context.Background()); status.FilesystemReadyBacklog != 0 || prober.probeCalls != 2 {
+		t.Fatalf("reused confirmations did not settle: status=%#v calls=%d", status, prober.probeCalls)
+	}
+	restarted := newManager(manager.config, store, prober, nil, fixedNow)
+	if err := restarted.Initialize(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if err := restarted.ScanOnce(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if status := restarted.Status(context.Background()); status.FilesystemReadyBacklog != 0 || prober.probeCalls != 2 {
+		t.Fatalf("reused confirmation restart = status=%#v calls=%d", status, prober.probeCalls)
+	}
+}
+
 func TestManagerKeepsIncompleteAndGrowingFilesPending(t *testing.T) {
 	manager, store, cfg := openTestManager(t, fakeProber{})
 	defer store.Close()
@@ -122,14 +180,13 @@ func TestManagerKeepsIncompleteAndGrowingFilesPending(t *testing.T) {
 		sidecar.SizeBytes++
 		sidecar.SHA256 = hashBytes([]byte("initial!"))
 	})
-	go func() {
-		time.Sleep(20 * time.Millisecond)
+	manager.afterFirstStat = func() {
 		file, openErr := os.OpenFile(segment.mediaPath, os.O_APPEND|os.O_WRONLY, 0o600)
 		if openErr == nil {
 			_, _ = file.Write([]byte("!"))
 			_ = file.Close()
 		}
-	}()
+	}
 	accepted, err = manager.ProcessReady(context.Background(), segment.readyPath)
 	if err != nil || accepted {
 		t.Fatalf("growing media = %t, %v", accepted, err)
@@ -160,6 +217,283 @@ func TestManagerReportsFilesystemBacklogBytesWithoutDoubleCounting(t *testing.T)
 	}
 	if status.Ingest.Pending != 1 || status.Ingest.Backlog != 1 {
 		t.Fatalf("projection backlog was duplicated: %#v", status.Ingest)
+	}
+}
+
+func TestManagerRotatesBoundedScanPastPendingEntry(t *testing.T) {
+	manager, store, cfg := openTestManager(t, fakeProber{})
+	defer store.Close()
+	manager.config.MediaIngest.MaxScanEntries = 1
+	pendingPath := filepath.Join(cfg.MediaIngest.InboxDirectory, "a-pending.mp4")
+	if err := os.WriteFile(pendingPath, []byte("pending"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(pendingPath+ReadySuffix, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	valid := writeSegment(t, cfg.MediaIngest.InboxDirectory, "b-valid.mp4", []byte(strings.Repeat("valid-", 100)), nil)
+	if err := manager.ScanOnce(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(valid.confirmationPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("valid segment was processed in first bounded scan: %v", err)
+	}
+	if err := manager.ScanOnce(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(valid.confirmationPath); err != nil {
+		t.Fatalf("valid segment starved behind pending entry: %v", err)
+	}
+}
+
+func TestManagerBoundsConfirmationVerificationPerScan(t *testing.T) {
+	manager, store, cfg := openTestManager(t, fakeProber{})
+	defer store.Close()
+	manager.config.MediaIngest.MaxScanEntries = 1
+	first := writeSegment(t, cfg.MediaIngest.InboxDirectory, "a-confirmed.mp4", []byte(strings.Repeat("first-", 100)), nil)
+	second := writeSegment(t, cfg.MediaIngest.InboxDirectory, "b-confirmed.mp4", []byte(strings.Repeat("second-", 100)), nil)
+	for _, readyPath := range []string{first.readyPath, second.readyPath} {
+		if accepted, err := manager.ProcessReady(context.Background(), readyPath); err != nil || !accepted {
+			t.Fatalf("ProcessReady(%s) = %t, %v", readyPath, accepted, err)
+		}
+	}
+	if err := manager.ScanOnce(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if status := manager.Status(context.Background()); status.FilesystemReadyBacklog != 1 {
+		t.Fatalf("first bounded confirmation scan status = %#v", status)
+	}
+	if err := manager.ScanOnce(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if status := manager.Status(context.Background()); status.FilesystemReadyBacklog != 0 {
+		t.Fatalf("second bounded confirmation scan status = %#v", status)
+	}
+}
+
+func TestConfirmationMustBindCurrentSourceAndManagedMedia(t *testing.T) {
+	manager, store, cfg := openTestManager(t, fakeProber{})
+	defer store.Close()
+	first := writeSegment(t, cfg.MediaIngest.InboxDirectory, "first.mp4", []byte(strings.Repeat("first-", 100)), nil)
+	accepted, err := manager.ProcessReady(context.Background(), first.readyPath)
+	if err != nil || !accepted {
+		t.Fatalf("first ProcessReady() = %t, %v", accepted, err)
+	}
+	second := writeSegment(t, cfg.MediaIngest.InboxDirectory, "second.mp4", []byte(strings.Repeat("second-", 100)), nil)
+	firstConfirmation, err := os.ReadFile(first.confirmationPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(second.confirmationPath, firstConfirmation, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.ScanOnce(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	summary, err := store.MediaIngestSummary(context.Background())
+	if err != nil || summary.TotalSegments != 2 {
+		t.Fatalf("copied confirmation hid current source: %#v, %v", summary, err)
+	}
+	firstInfo, err := os.Stat(first.mediaPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tampered := []byte(strings.Repeat("x", int(firstInfo.Size())))
+	if err := os.WriteFile(first.mediaPath, tampered, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(first.mediaPath, firstInfo.ModTime(), firstInfo.ModTime()); err != nil {
+		t.Fatal(err)
+	}
+	if valid, err := manager.confirmationValid(context.Background(), first.confirmationPath); err == nil || valid {
+		t.Fatalf("same-size same-mtime source replacement bypassed confirmation binding: %t, %v", valid, err)
+	}
+	managed, err := filepath.Glob(filepath.Join(manager.acceptedRoot, "*.media"))
+	if err != nil || len(managed) != 2 {
+		t.Fatalf("managed files = %v, %v", managed, err)
+	}
+	for _, path := range managed {
+		if err := os.Remove(path); err != nil {
+			t.Fatal(err)
+		}
+	}
+	valid, err := manager.confirmationValid(context.Background(), first.confirmationPath)
+	if err == nil || valid {
+		t.Fatalf("confirmation remained valid after managed media removal: %t, %v", valid, err)
+	}
+}
+
+func TestConfirmationRequiresAcceptedTimestamp(t *testing.T) {
+	manager, store, cfg := openTestManager(t, fakeProber{})
+	defer store.Close()
+	segment := writeSegment(t, cfg.MediaIngest.InboxDirectory, "timestamp.mp4", []byte(strings.Repeat("timestamp-", 100)), nil)
+	accepted, err := manager.ProcessReady(context.Background(), segment.readyPath)
+	if err != nil || !accepted {
+		t.Fatalf("ProcessReady() = %t, %v", accepted, err)
+	}
+	raw, err := os.ReadFile(segment.confirmationPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var fields map[string]any
+	if err := json.Unmarshal(raw, &fields); err != nil {
+		t.Fatal(err)
+	}
+	delete(fields, "accepted_at_utc")
+	raw, err = json.Marshal(fields)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(segment.confirmationPath, raw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if valid, err := manager.confirmationValid(context.Background(), segment.confirmationPath); err == nil || valid || ErrorCode(err) != CodeSidecarInvalid {
+		t.Fatalf("confirmation without accepted_at_utc = %t, %v", valid, err)
+	}
+}
+
+func TestConfirmationCannotHideChangedSidecarMetadata(t *testing.T) {
+	manager, store, cfg := openTestManager(t, fakeProber{})
+	defer store.Close()
+	segment := writeSegment(t, cfg.MediaIngest.InboxDirectory, "metadata-binding.mp4", []byte(strings.Repeat("metadata-", 100)), nil)
+	if accepted, err := manager.ProcessReady(context.Background(), segment.readyPath); err != nil || !accepted {
+		t.Fatalf("ProcessReady() = %t, %v", accepted, err)
+	}
+	sidecarRaw, err := os.ReadFile(segment.mediaPath + SidecarSuffix)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var sidecar Sidecar
+	if err := json.Unmarshal(sidecarRaw, &sidecar); err != nil {
+		t.Fatal(err)
+	}
+	(*sidecar.ClockErrorMS)++
+	sidecarRaw, err = json.Marshal(sidecar)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(segment.mediaPath+SidecarSuffix, sidecarRaw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	parsed, err := parseSidecar(sidecarRaw, manager.config.MediaMaxSegmentDuration())
+	if err != nil {
+		t.Fatal(err)
+	}
+	confirmationRaw, err := os.ReadFile(segment.confirmationPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var marker confirmation
+	if err := json.Unmarshal(confirmationRaw, &marker); err != nil {
+		t.Fatal(err)
+	}
+	marker.SidecarFingerprint = parsed.Fingerprint
+	confirmationRaw, err = json.Marshal(marker)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(segment.confirmationPath, confirmationRaw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.ScanOnce(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	assertQuarantineReason(t, manager.quarantineRoot, CodeMetadataConflict)
+}
+
+func TestPersistentConfirmationChecksKeepLargeAcceptedInboxClear(t *testing.T) {
+	manager, store, cfg := openTestManager(t, fakeProber{})
+	defer store.Close()
+	manager.config.MediaIngest.MaxScanEntries = 1
+	const count = 18
+	for index := 0; index < count; index++ {
+		name := fmt.Sprintf("confirmed-%02d.mp4", index)
+		segment := writeSegment(t, cfg.MediaIngest.InboxDirectory, name, []byte(strings.Repeat(name, 10)), nil)
+		if accepted, err := manager.ProcessReady(context.Background(), segment.readyPath); err != nil || !accepted {
+			t.Fatalf("ProcessReady(%s) = %t, %v", name, accepted, err)
+		}
+	}
+	for index := 0; index < count; index++ {
+		if err := manager.ScanOnce(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if status := manager.Status(context.Background()); status.FilesystemReadyBacklog != 0 {
+		t.Fatalf("accepted inbox remained a false backlog: %#v", status)
+	}
+	restarted := newManager(manager.config, store, fakeProber{}, nil, fixedNow)
+	if err := restarted.Initialize(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if err := restarted.ScanOnce(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if status := restarted.Status(context.Background()); status.FilesystemReadyBacklog != 0 {
+		t.Fatalf("persistent checks did not survive restart: %#v", status)
+	}
+}
+
+func TestManagerRestoresMissingAcceptedMediaFromPreservedSource(t *testing.T) {
+	manager, store, cfg := openTestManager(t, fakeProber{})
+	defer store.Close()
+	contents := []byte(strings.Repeat("restore-", 100))
+	segment := writeSegment(t, cfg.MediaIngest.InboxDirectory, "restore.mp4", contents, nil)
+	if accepted, err := manager.ProcessReady(context.Background(), segment.readyPath); err != nil || !accepted {
+		t.Fatalf("ProcessReady() = %t, %v", accepted, err)
+	}
+	managed, err := filepath.Glob(filepath.Join(manager.acceptedRoot, "*.media"))
+	if err != nil || len(managed) != 1 {
+		t.Fatalf("managed files = %v, %v", managed, err)
+	}
+	if err := os.Remove(managed[0]); err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.ScanOnce(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	restored, err := os.ReadFile(managed[0])
+	if err != nil || string(restored) != string(contents) {
+		t.Fatalf("restored media mismatch: size=%d err=%v", len(restored), err)
+	}
+	if summary, err := store.MediaIngestSummary(context.Background()); err != nil || summary.Accepted != 1 || summary.TotalSegments != 1 {
+		t.Fatalf("restore summary = %#v, %v", summary, err)
+	}
+}
+
+func TestAcceptedProjectionRecoversAcrossFailedGeneration(t *testing.T) {
+	manager, store, cfg := openTestManager(t, fakeProber{})
+	defer store.Close()
+	segment := writeSegment(t, cfg.MediaIngest.InboxDirectory, "accepted-generation.mp4", []byte(strings.Repeat("accepted-", 100)), nil)
+	if accepted, err := manager.ProcessReady(context.Background(), segment.readyPath); err != nil || !accepted {
+		t.Fatalf("initial ProcessReady() = %t, %v", accepted, err)
+	}
+	managed, err := filepath.Glob(filepath.Join(manager.acceptedRoot, "*.media"))
+	if err != nil || len(managed) != 1 {
+		t.Fatalf("managed files = %v, %v", managed, err)
+	}
+	if err := os.WriteFile(managed[0], []byte("tampered"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if accepted, err := manager.ProcessReady(context.Background(), segment.readyPath); err != nil || accepted {
+		t.Fatalf("tampered ProcessReady() = %t, %v", accepted, err)
+	}
+	if summary, err := store.MediaIngestSummary(context.Background()); err != nil || summary.Failed != 1 {
+		t.Fatalf("failed generation summary = %#v, %v", summary, err)
+	}
+	if err := os.Remove(managed[0]); err != nil {
+		t.Fatal(err)
+	}
+	if accepted, err := manager.ProcessReady(context.Background(), segment.readyPath); err != nil || !accepted {
+		t.Fatalf("recovery ProcessReady() = %t, %v", accepted, err)
+	}
+	if summary, err := store.MediaIngestSummary(context.Background()); err != nil || summary.Accepted != 1 || summary.Failed != 0 {
+		t.Fatalf("recovered generation summary = %#v, %v", summary, err)
+	}
+	if err := store.RebuildMediaProjections(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if summary, err := store.MediaIngestSummary(context.Background()); err != nil || summary.Accepted != 1 || summary.Failed != 0 {
+		t.Fatalf("rebuilt recovered summary = %#v, %v", summary, err)
 	}
 }
 
@@ -519,6 +853,243 @@ func TestManagerRecordsQuarantineFailureWithoutAccepting(t *testing.T) {
 	summary, err := store.MediaIngestSummary(context.Background())
 	if err != nil || summary.Failed != 1 || summary.TotalSegments != 0 {
 		t.Fatalf("quarantine failure summary = %#v, %v", summary, err)
+	}
+}
+
+func TestManagerDoesNotRepeatUnchangedSuccessfulQuarantine(t *testing.T) {
+	manager, store, cfg := openTestManager(t, fakeProber{})
+	defer store.Close()
+	segment := writeSegment(t, cfg.MediaIngest.InboxDirectory, "terminal-quarantine.mp4", []byte(strings.Repeat("broken-", 100)), func(sidecar *Sidecar) {
+		sidecar.SHA256 = strings.Repeat("a", 64)
+	})
+	copyChunks := 0
+	manager.afterCopyChunk = func(int64) error { copyChunks++; return nil }
+	if accepted, err := manager.ProcessReady(context.Background(), segment.readyPath); err != nil || accepted {
+		t.Fatalf("first ProcessReady() = %t, %v", accepted, err)
+	}
+	firstCopyChunks := copyChunks
+	if accepted, err := manager.ProcessReady(context.Background(), segment.readyPath); err != nil || accepted {
+		t.Fatalf("second ProcessReady() = %t, %v", accepted, err)
+	}
+	if copyChunks != firstCopyChunks {
+		t.Fatalf("unchanged quarantine was copied again: before=%d after=%d", firstCopyChunks, copyChunks)
+	}
+}
+
+func TestPersistentTerminalChecksDoNotForgetLargeQuarantineInbox(t *testing.T) {
+	manager, store, cfg := openTestManager(t, fakeProber{})
+	defer store.Close()
+	manager.config.MediaIngest.MaxScanEntries = 1
+	copyChunks := 0
+	manager.afterCopyChunk = func(int64) error { copyChunks++; return nil }
+	const count = 18
+	for index := 0; index < count; index++ {
+		name := fmt.Sprintf("quarantined-%02d.mp4", index)
+		writeSegment(t, cfg.MediaIngest.InboxDirectory, name, []byte(strings.Repeat(name, 10)), func(sidecar *Sidecar) {
+			sidecar.SHA256 = strings.Repeat("f", 64)
+		})
+	}
+	for index := 0; index < count; index++ {
+		if err := manager.ScanOnce(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	firstPassCopies := copyChunks
+	for index := 0; index < count; index++ {
+		if err := manager.ScanOnce(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if copyChunks != firstPassCopies {
+		t.Fatalf("persistent terminal checks forgot quarantines: before=%d after=%d", firstPassCopies, copyChunks)
+	}
+}
+
+func TestManagerRepairsDeletedQuarantineCopy(t *testing.T) {
+	manager, store, cfg := openTestManager(t, fakeProber{})
+	defer store.Close()
+	segment := writeSegment(t, cfg.MediaIngest.InboxDirectory, "repair-quarantine.mp4", []byte(strings.Repeat("broken-", 100)), func(sidecar *Sidecar) {
+		sidecar.SHA256 = strings.Repeat("a", 64)
+	})
+	if accepted, err := manager.ProcessReady(context.Background(), segment.readyPath); err != nil || accepted {
+		t.Fatalf("first ProcessReady() = %t, %v", accepted, err)
+	}
+	quarantined, err := filepath.Glob(filepath.Join(manager.quarantineRoot, "*.media"))
+	if err != nil || len(quarantined) != 1 {
+		t.Fatalf("quarantine files = %v, %v", quarantined, err)
+	}
+	if err := os.Remove(quarantined[0]); err != nil {
+		t.Fatal(err)
+	}
+	if accepted, err := manager.ProcessReady(context.Background(), segment.readyPath); err != nil || accepted {
+		t.Fatalf("repair ProcessReady() = %t, %v", accepted, err)
+	}
+	if _, err := os.Stat(quarantined[0]); err != nil {
+		t.Fatalf("deleted quarantine copy was not repaired: %v", err)
+	}
+	reasons, err := filepath.Glob(filepath.Join(manager.quarantineRoot, "*.reason.json"))
+	if err != nil || len(reasons) != 1 {
+		t.Fatalf("quarantine reasons = %v, %v", reasons, err)
+	}
+	if err := os.Remove(reasons[0]); err != nil {
+		t.Fatal(err)
+	}
+	if accepted, err := manager.ProcessReady(context.Background(), segment.readyPath); err != nil || accepted {
+		t.Fatalf("reason repair ProcessReady() = %t, %v", accepted, err)
+	}
+	if _, err := os.Stat(reasons[0]); err != nil {
+		t.Fatalf("deleted quarantine reason was not repaired: %v", err)
+	}
+}
+
+func TestQuarantineProjectionRecoversAcrossFailedGeneration(t *testing.T) {
+	manager, store, cfg := openTestManager(t, fakeProber{})
+	defer store.Close()
+	segment := writeSegment(t, cfg.MediaIngest.InboxDirectory, "quarantine-generation.mp4", []byte(strings.Repeat("broken-", 100)), func(sidecar *Sidecar) {
+		sidecar.SHA256 = strings.Repeat("a", 64)
+	})
+	if accepted, err := manager.ProcessReady(context.Background(), segment.readyPath); err != nil || accepted {
+		t.Fatalf("initial ProcessReady() = %t, %v", accepted, err)
+	}
+	quarantined, err := filepath.Glob(filepath.Join(manager.quarantineRoot, "*.media"))
+	if err != nil || len(quarantined) != 1 {
+		t.Fatalf("quarantine files = %v, %v", quarantined, err)
+	}
+	if err := os.WriteFile(quarantined[0], []byte("tampered"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if accepted, err := manager.ProcessReady(context.Background(), segment.readyPath); err == nil || accepted || ErrorCode(err) != CodeQuarantineFailed {
+		t.Fatalf("tampered ProcessReady() = %t, %v", accepted, err)
+	}
+	if summary, err := store.MediaIngestSummary(context.Background()); err != nil || summary.Failed != 1 {
+		t.Fatalf("failed generation summary = %#v, %v", summary, err)
+	}
+	if err := os.Remove(quarantined[0]); err != nil {
+		t.Fatal(err)
+	}
+	if accepted, err := manager.ProcessReady(context.Background(), segment.readyPath); err != nil || accepted {
+		t.Fatalf("recovery ProcessReady() = %t, %v", accepted, err)
+	}
+	if summary, err := store.MediaIngestSummary(context.Background()); err != nil || summary.Quarantined != 1 || summary.Failed != 0 {
+		t.Fatalf("recovered generation summary = %#v, %v", summary, err)
+	}
+	if err := store.RebuildMediaProjections(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if summary, err := store.MediaIngestSummary(context.Background()); err != nil || summary.Quarantined != 1 || summary.Failed != 0 {
+		t.Fatalf("rebuilt recovered summary = %#v, %v", summary, err)
+	}
+}
+
+func TestManagerPersistsInvalidSidecarTerminalChecks(t *testing.T) {
+	manager, store, cfg := openTestManager(t, fakeProber{})
+	defer store.Close()
+	mediaPath := filepath.Join(cfg.MediaIngest.InboxDirectory, "empty-sidecar.mp4")
+	if err := os.WriteFile(mediaPath, []byte("broken"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(mediaPath+SidecarSuffix, []byte{}, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	readyPath := mediaPath + ReadySuffix
+	if err := os.WriteFile(readyPath, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if accepted, err := manager.ProcessReady(context.Background(), readyPath); err != nil || accepted {
+		t.Fatalf("first ProcessReady() = %t, %v", accepted, err)
+	}
+	quarantined, err := filepath.Glob(filepath.Join(manager.quarantineRoot, "*.media"))
+	if err != nil || len(quarantined) != 1 {
+		t.Fatalf("quarantine files = %v, %v", quarantined, err)
+	}
+	firstInfo, err := os.Stat(quarantined[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if accepted, err := manager.ProcessReady(context.Background(), readyPath); err != nil || accepted {
+		t.Fatalf("second ProcessReady() = %t, %v", accepted, err)
+	}
+	secondInfo, err := os.Stat(quarantined[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !firstInfo.ModTime().Equal(secondInfo.ModTime()) {
+		t.Fatal("unchanged invalid sidecar was quarantined again")
+	}
+}
+
+func TestManagerRejectsPreexistingInvalidQuarantineTarget(t *testing.T) {
+	manager, store, cfg := openTestManager(t, fakeProber{})
+	defer store.Close()
+	segment := writeSegment(t, cfg.MediaIngest.InboxDirectory, "forged-quarantine.mp4", []byte("broken"), func(sidecar *Sidecar) {
+		sidecar.SHA256 = strings.Repeat("f", 64)
+	})
+	raw, err := os.ReadFile(segment.mediaPath + SidecarSuffix)
+	if err != nil {
+		t.Fatal(err)
+	}
+	parsed, err := parseSidecar(raw, manager.config.MediaMaxSegmentDuration())
+	if err != nil {
+		t.Fatal(err)
+	}
+	ingestKey := hashText(strings.ToLower(filepath.Clean(cfg.MediaIngest.InboxDirectory)) + "\x00" + filepath.Base(segment.mediaPath))
+	mediaTarget := filepath.Join(manager.quarantineRoot, ingestKey+"-"+parsed.Fingerprint+".media")
+	if err := os.Mkdir(mediaTarget, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	accepted, err := manager.ProcessReady(context.Background(), segment.readyPath)
+	if err == nil || accepted || ErrorCode(err) != CodeQuarantineFailed {
+		t.Fatalf("ProcessReady() = %t, %v; want quarantine failure", accepted, err)
+	}
+	summary, err := store.MediaIngestSummary(context.Background())
+	if err != nil || summary.Quarantined != 0 || summary.Failed != 1 {
+		t.Fatalf("invalid target summary = %#v, %v", summary, err)
+	}
+}
+
+func TestManagerRetriesRuntimeProbeOutageWithoutQuarantine(t *testing.T) {
+	prober := &mutableProber{version: SupportedFFprobeVersion}
+	manager, store, cfg := openTestManager(t, prober)
+	defer store.Close()
+	segment := writeSegment(t, cfg.MediaIngest.InboxDirectory, "probe-outage.mp4", []byte(strings.Repeat("probe-", 100)), nil)
+	prober.probeError = &Error{Code: CodeProbeUnavailable, Err: errors.New("ffprobe disappeared")}
+	manager.scanAndLog(context.Background())
+	status := manager.Status(context.Background())
+	if status.Status != ModuleUnavailable || status.ErrorCode != CodeProbeUnavailable {
+		t.Fatalf("outage status = %#v", status)
+	}
+	if matches, _ := filepath.Glob(filepath.Join(manager.quarantineRoot, "*.media")); len(matches) != 0 {
+		t.Fatalf("runtime outage quarantined legal media: %v", matches)
+	}
+	if _, err := os.Stat(segment.mediaPath); err != nil {
+		t.Fatalf("source not preserved: %v", err)
+	}
+	prober.probeError = nil
+	manager.scanAndLog(context.Background())
+	status = manager.Status(context.Background())
+	if status.Status != ModuleHealthy || status.Ingest.Accepted != 1 {
+		t.Fatalf("recovered status = %#v", status)
+	}
+}
+
+func TestManagerRechecksPinnedProbeVersionEachScan(t *testing.T) {
+	prober := &mutableProber{version: SupportedFFprobeVersion}
+	manager, store, cfg := openTestManager(t, prober)
+	defer store.Close()
+	segment := writeSegment(t, cfg.MediaIngest.InboxDirectory, "probe-version.mp4", []byte(strings.Repeat("probe-version-", 100)), nil)
+	prober.version = "replaced-version"
+	manager.scanAndLog(context.Background())
+	status := manager.Status(context.Background())
+	if status.Status != ModuleUnavailable || status.ErrorCode != CodeProbeVersionMismatch || prober.probeCalls != 0 {
+		t.Fatalf("replaced ffprobe status = %#v calls=%d", status, prober.probeCalls)
+	}
+	if _, err := os.Stat(segment.confirmationPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("segment accepted with unpinned ffprobe: %v", err)
+	}
+	prober.version = SupportedFFprobeVersion
+	manager.scanAndLog(context.Background())
+	if status = manager.Status(context.Background()); status.Status != ModuleHealthy || status.Ingest.Accepted != 1 {
+		t.Fatalf("version recovery status = %#v", status)
 	}
 }
 

@@ -15,7 +15,7 @@ import (
 
 const (
 	CurrentSchemaVersion      = 1
-	currentMediaSchemaVersion = 1
+	currentMediaSchemaVersion = 2
 )
 
 type migration struct {
@@ -30,7 +30,7 @@ func repositoryMigrations() ([]migration, error) {
 }
 
 func repositoryMediaMigrations() ([]migration, error) {
-	return loadMigrations([]string{"002_media_ingest.sql"})
+	return loadMigrations([]string{"002_media_ingest.sql", "003_media_file_checks.sql"})
 }
 
 func loadMigrations(files []string) ([]migration, error) {

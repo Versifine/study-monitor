@@ -157,7 +157,7 @@ clock_offset_ms, clock_error_ms, idempotency_key, payload_json, payload_hash, co
 	store := openTestStore(t, path)
 	assertTableCount(t, store.db, "raw_events", 1)
 	assertTableCount(t, store.db, "schema_migrations", 1)
-	assertTableCount(t, store.db, "media_schema_migrations", 1)
+	assertTableCount(t, store.db, "media_schema_migrations", 2)
 	assertTableCount(t, store.db, "media_segments", 0)
 	var schemaVersion int
 	if err := store.db.QueryRow("PRAGMA user_version").Scan(&schemaVersion); err != nil {

@@ -1,6 +1,7 @@
 package mediaingest
 
 import (
+	"container/heap"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -11,7 +12,9 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/Versifine/study-monitor/internal/config"
@@ -36,6 +39,53 @@ type Manager struct {
 	afterCopyChunk   func(int64) error
 	afterRename      func(string) error
 	beforeQuarantine func() error
+	afterFirstStat   func()
+
+	scanMu     sync.Mutex
+	scanCursor string
+}
+
+type fileStamp struct {
+	size       int64
+	modifiedNS int64
+	identity   string
+	changeTime int64
+}
+
+type readyCandidate struct {
+	path string
+	key  string
+	size int64
+}
+
+type candidateHeap []readyCandidate
+
+func (candidates candidateHeap) Len() int { return len(candidates) }
+func (candidates candidateHeap) Less(left, right int) bool {
+	return candidates[left].key > candidates[right].key
+}
+func (candidates candidateHeap) Swap(left, right int) {
+	candidates[left], candidates[right] = candidates[right], candidates[left]
+}
+func (candidates *candidateHeap) Push(value any) {
+	*candidates = append(*candidates, value.(readyCandidate))
+}
+func (candidates *candidateHeap) Pop() any {
+	old := *candidates
+	last := old[len(old)-1]
+	*candidates = old[:len(old)-1]
+	return last
+}
+
+func retainSmallest(candidates *candidateHeap, candidate readyCandidate, limit int) {
+	if candidates.Len() < limit {
+		heap.Push(candidates, candidate)
+		return
+	}
+	if limit > 0 && candidate.key < (*candidates)[0].key {
+		heap.Pop(candidates)
+		heap.Push(candidates, candidate)
+	}
 }
 
 type processIdentity struct {
@@ -50,6 +100,7 @@ type confirmation struct {
 	SchemaVersion        int    `json:"schema_version"`
 	CollectorID          string `json:"collector_id"`
 	SourceIdempotencyKey string `json:"source_idempotency_key"`
+	SidecarFingerprint   string `json:"sidecar_fingerprint"`
 	MediaSegmentID       int64  `json:"media_segment_id"`
 	SHA256               string `json:"sha256"`
 	MetadataHash         string `json:"metadata_hash"`
@@ -58,7 +109,7 @@ type confirmation struct {
 
 var confirmationFields = []string{
 	"schema_version", "collector_id", "source_idempotency_key", "media_segment_id",
-	"sha256", "metadata_hash", "accepted_at_utc",
+	"sidecar_fingerprint", "sha256", "metadata_hash", "accepted_at_utc",
 }
 
 func New(cfg config.Config, repository Repository, logger *logging.Logger) *Manager {
@@ -177,18 +228,28 @@ func (manager *Manager) Status(ctx context.Context) Status {
 }
 
 func (manager *Manager) ScanOnce(ctx context.Context) error {
+	manager.scanMu.Lock()
+	defer manager.scanMu.Unlock()
 	if !manager.state.isInitialized() {
 		return &Error{Code: CodeProbeUnavailable, Err: errors.New("media ingest module is not healthy")}
+	}
+	version, err := manager.prober.Version(ctx, manager.config.FFprobeTimeout())
+	if err != nil {
+		return err
+	}
+	if version != SupportedFFprobeVersion {
+		return &Error{Code: CodeProbeVersionMismatch, Err: fmt.Errorf("unsupported ffprobe version %q", version)}
 	}
 	directory, err := os.Open(manager.config.MediaIngest.InboxDirectory)
 	if err != nil {
 		return &Error{Code: CodeStorageFailed, Err: errors.New("media inbox cannot be opened")}
 	}
 	defer directory.Close()
-	processed := 0
+	limit := manager.config.MediaIngest.MaxScanEntries
+	afterCursor := make(candidateHeap, 0, limit)
+	wrapped := make(candidateHeap, 0, limit)
 	remaining := int64(0)
 	remainingBytes := int64(0)
-	var firstError error
 	for {
 		entries, err := directory.ReadDir(128)
 		if err != nil && !errors.Is(err, io.EOF) {
@@ -199,27 +260,71 @@ func (manager *Manager) ScanOnce(ctx context.Context) error {
 				continue
 			}
 			readyPath := filepath.Join(manager.config.MediaIngest.InboxDirectory, entry.Name())
-			confirmed, confirmationErr := manager.confirmationValid(ctx, strings.TrimSuffix(readyPath, ReadySuffix)+ConfirmationSuffix)
-			if confirmationErr == nil && confirmed {
+			confirmed, confirmationErr := manager.confirmationCached(ctx, strings.TrimSuffix(readyPath, ReadySuffix)+ConfirmationSuffix)
+			if confirmationErr != nil {
+				return confirmationErr
+			}
+			if confirmed {
 				continue
 			}
-			if processed >= manager.config.MediaIngest.MaxScanEntries {
-				remaining++
-				remainingBytes = saturatedAdd(remainingBytes, manager.readySourceSize(readyPath))
-				continue
+			size := manager.readySourceSize(readyPath)
+			name := filepath.Base(readyPath)
+			key := strings.ToLower(name) + "\x00" + name
+			candidate := readyCandidate{path: readyPath, key: key, size: size}
+			if key > manager.scanCursor {
+				retainSmallest(&afterCursor, candidate, limit)
+			} else {
+				retainSmallest(&wrapped, candidate, limit)
 			}
-			processed++
-			accepted, processErr := manager.ProcessReady(ctx, readyPath)
-			if processErr != nil || !accepted {
-				remaining++
-				remainingBytes = saturatedAdd(remainingBytes, manager.readySourceSize(readyPath))
-			}
-			if processErr != nil && firstError == nil {
-				firstError = processErr
-			}
+			remaining++
+			remainingBytes = saturatedAdd(remainingBytes, size)
 		}
 		if errors.Is(err, io.EOF) {
 			break
+		}
+	}
+	sort.Slice(afterCursor, func(left, right int) bool {
+		return afterCursor[left].key < afterCursor[right].key
+	})
+	sort.Slice(wrapped, func(left, right int) bool {
+		return wrapped[left].key < wrapped[right].key
+	})
+	selected := make([]readyCandidate, 0, limit)
+	for _, candidate := range afterCursor {
+		if len(selected) == limit {
+			break
+		}
+		selected = append(selected, candidate)
+	}
+	for _, candidate := range wrapped {
+		if len(selected) == limit {
+			break
+		}
+		selected = append(selected, candidate)
+	}
+	var firstError error
+	for _, candidate := range selected {
+		readyPath := candidate.path
+		manager.scanCursor = candidate.key
+		confirmed, confirmationErr := manager.confirmationValid(ctx, strings.TrimSuffix(readyPath, ReadySuffix)+ConfirmationSuffix)
+		if confirmationErr == nil && confirmed {
+			remaining--
+			remainingBytes -= candidate.size
+			continue
+		}
+		if confirmationErr != nil && ErrorCode(confirmationErr) == CodeDatabaseFailed {
+			if firstError == nil {
+				firstError = confirmationErr
+			}
+			continue
+		}
+		accepted, processErr := manager.ProcessReady(ctx, readyPath)
+		if accepted {
+			remaining--
+			remainingBytes -= candidate.size
+		}
+		if processErr != nil && firstError == nil {
+			firstError = processErr
 		}
 	}
 	manager.state.Lock()
@@ -283,6 +388,13 @@ func (manager *Manager) ProcessReady(ctx context.Context, readyPath string) (boo
 		return false, manager.record(ctx, identity, "failed", ErrorCode(err), "", 0)
 	}
 	identity.sourceFingerprint = hashBytes(sidecarRaw)
+	unchangedTerminal, terminalErr := manager.terminalUnchanged(ctx, identity, mediaPath)
+	if terminalErr != nil {
+		return false, terminalErr
+	}
+	if unchangedTerminal {
+		return false, nil
+	}
 	sidecar, err := parseSidecar(sidecarRaw, manager.config.MediaMaxSegmentDuration())
 	if err != nil {
 		if ErrorCode(err) == CodeSidecarIncomplete {
@@ -293,6 +405,13 @@ func (manager *Manager) ProcessReady(ctx context.Context, readyPath string) (boo
 	identity.sourceFingerprint = sidecar.Fingerprint
 	identity.collectorID = sidecar.CollectorID
 	identity.sourceIdempotencyKey = sidecar.SourceIdempotencyKey
+	unchangedTerminal, err = manager.terminalUnchanged(ctx, identity, mediaPath)
+	if err != nil {
+		return false, err
+	}
+	if unchangedTerminal {
+		return false, nil
+	}
 
 	first, err := manager.stableSourceStat(mediaPath)
 	if err != nil {
@@ -300,6 +419,9 @@ func (manager *Manager) ProcessReady(ctx context.Context, readyPath string) (boo
 			return false, manager.record(ctx, identity, "pending", CodeSourceMissing, "", 0)
 		}
 		return false, manager.record(ctx, identity, "failed", ErrorCode(err), "", 0)
+	}
+	if manager.afterFirstStat != nil {
+		manager.afterFirstStat()
 	}
 	if first.Size() > manager.config.MediaIngest.MaxSegmentBytes || sidecar.SizeBytes > manager.config.MediaIngest.MaxSegmentBytes {
 		return false, manager.record(ctx, identity, "failed", CodeTooLarge, "", 0)
@@ -333,6 +455,15 @@ func (manager *Manager) ProcessReady(ctx context.Context, readyPath string) (boo
 	}
 	probe, err := manager.prober.Probe(ctx, stagingPath, manager.config.FFprobeTimeout())
 	if err != nil {
+		if ctx.Err() != nil {
+			return false, ctx.Err()
+		}
+		if code := ErrorCode(err); code == CodeProbeUnavailable || code == CodeProbeVersionMismatch {
+			if recordErr := manager.record(ctx, identity, "pending", code, manager.relativeManaged(stagingPath), 0); recordErr != nil {
+				return false, recordErr
+			}
+			return false, err
+		}
 		return false, manager.quarantine(ctx, identity, mediaPath, sidecarRaw, stagingPath, ErrorCode(err))
 	}
 	if probe.MediaType != sidecar.MediaType {
@@ -365,7 +496,16 @@ func (manager *Manager) ProcessReady(ctx context.Context, readyPath string) (boo
 	if claim.Status == eventstore.MediaWriteDuplicate {
 		existingPath := filepath.Join(manager.storageRoot, filepath.FromSlash(claim.ManagedRelativePath))
 		if err := manager.verifyManagedFile(existingPath, sidecar.SizeBytes, sidecar.SHA256); err != nil {
-			return false, manager.record(ctx, identity, "failed", CodeStorageFailed, manager.relativeManaged(stagingPath), claim.SegmentID)
+			if _, inspectErr := os.Lstat(existingPath); !errors.Is(inspectErr, os.ErrNotExist) {
+				return false, manager.record(ctx, identity, "failed", CodeStorageFailed, manager.relativeManaged(stagingPath), claim.SegmentID)
+			}
+			expectedPath := filepath.Join(manager.acceptedRoot, sidecar.SHA256+".media")
+			if filepath.Clean(existingPath) != filepath.Clean(expectedPath) {
+				return false, manager.record(ctx, identity, "failed", CodeStorageFailed, manager.relativeManaged(stagingPath), claim.SegmentID)
+			}
+			if err := manager.installAccepted(stagingPath, existingPath, sidecar.SizeBytes, sidecar.SHA256); err != nil {
+				return false, manager.record(ctx, identity, "failed", ErrorCode(err), manager.relativeManaged(stagingPath), claim.SegmentID)
+			}
 		}
 		_ = os.Remove(stagingPath)
 	} else {
@@ -416,6 +556,7 @@ func (manager *Manager) ProcessReady(ctx context.Context, readyPath string) (boo
 		SchemaVersion:        StatusSchemaVersion,
 		CollectorID:          sidecar.CollectorID,
 		SourceIdempotencyKey: sidecar.SourceIdempotencyKey,
+		SidecarFingerprint:   sidecar.Fingerprint,
 		MediaSegmentID:       claim.SegmentID,
 		SHA256:               sidecar.SHA256,
 		MetadataHash:         metadataDigest,
@@ -501,6 +642,64 @@ func hashBytes(value []byte) string {
 	return hex.EncodeToString(digest[:])
 }
 
+func stampFile(path string) (fileStamp, error) {
+	info, err := os.Lstat(path)
+	if err != nil {
+		return fileStamp{}, err
+	}
+	if !info.Mode().IsRegular() {
+		return fileStamp{}, errors.New("path is not a regular file")
+	}
+	identity, changeTime, err := platformFileStamp(path, info)
+	if err != nil {
+		return fileStamp{}, err
+	}
+	return fileStamp{size: info.Size(), modifiedNS: info.ModTime().UnixNano(), identity: identity, changeTime: changeTime}, nil
+}
+
+func (manager *Manager) terminalFileSignature(identity processIdentity, sourcePath string) (string, error) {
+	base := identity.ingestKey + "-" + identity.sourceFingerprint
+	paths := []string{
+		sourcePath,
+		sourcePath + SidecarSuffix,
+		filepath.Join(manager.quarantineRoot, base+".media"),
+		filepath.Join(manager.quarantineRoot, base+SidecarSuffix),
+		filepath.Join(manager.quarantineRoot, base+".reason.json"),
+	}
+	stamps := make([]fileStamp, 0, len(paths))
+	for _, path := range paths {
+		stamp, err := stampFile(path)
+		if err != nil {
+			return "", err
+		}
+		stamps = append(stamps, stamp)
+	}
+	return hashText(identity.sourceFingerprint + "\x00" + fmt.Sprintf("%#v", stamps)), nil
+}
+
+func (manager *Manager) terminalUnchanged(ctx context.Context, identity processIdentity, sourcePath string) (bool, error) {
+	signature, err := manager.terminalFileSignature(identity, sourcePath)
+	if err != nil {
+		return false, nil
+	}
+	matches, err := manager.repository.MediaFileCheckMatches(ctx, identity.ingestKey, "quarantined", signature)
+	if err != nil {
+		return false, &Error{Code: CodeDatabaseFailed, Err: err}
+	}
+	return matches, nil
+}
+
+func (manager *Manager) rememberTerminal(ctx context.Context, identity processIdentity, sourcePath string) error {
+	signature, err := manager.terminalFileSignature(identity, sourcePath)
+	if err != nil {
+		return &Error{Code: CodeQuarantineFailed, Err: errors.New("quarantine artifacts cannot be verified")}
+	}
+	if err := manager.repository.SaveMediaFileCheck(ctx, identity.ingestKey, "quarantined", signature, manager.now().UTC().Format(time.RFC3339Nano)); err != nil {
+		return &Error{Code: CodeDatabaseFailed, Err: err}
+	}
+	return nil
+}
+
 func (manager *Manager) confirmationValid(ctx context.Context, path string) (bool, error) {
 	raw, err := manager.readInboxFile(path, manager.config.MediaIngest.MaxSidecarBytes)
 	if err != nil {
@@ -513,15 +712,126 @@ func (manager *Manager) confirmationValid(ctx context.Context, path string) (boo
 	if err := json.Unmarshal(raw, &value); err != nil || value.SchemaVersion != StatusSchemaVersion || value.MediaSegmentID <= 0 {
 		return false, &Error{Code: CodeSidecarInvalid, Err: errors.New("media confirmation is invalid")}
 	}
-	claim, err := manager.repository.ResolveMediaClaim(ctx, value.CollectorID, value.SourceIdempotencyKey, value.SHA256, value.MetadataHash)
+	acceptedAt, err := time.Parse(time.RFC3339Nano, value.AcceptedAtUTC)
+	_, offset := acceptedAt.Zone()
+	if err != nil || strings.TrimSpace(value.AcceptedAtUTC) != value.AcceptedAtUTC || strings.HasSuffix(value.AcceptedAtUTC, "-00:00") || offset != 0 {
+		return false, &Error{Code: CodeSidecarInvalid, Err: errors.New("media confirmation accepted_at_utc is invalid")}
+	}
+	mediaPath := strings.TrimSuffix(path, ConfirmationSuffix)
+	sidecarPath := mediaPath + SidecarSuffix
+	sidecarRaw, err := manager.readInboxFile(sidecarPath, manager.config.MediaIngest.MaxSidecarBytes)
 	if err != nil {
 		return false, err
 	}
-	return claim.Status == eventstore.MediaWriteDuplicate && claim.SegmentID == value.MediaSegmentID, nil
+	sidecar, err := parseSidecar(sidecarRaw, manager.config.MediaMaxSegmentDuration())
+	if err != nil {
+		return false, err
+	}
+	if value.CollectorID != sidecar.CollectorID || value.SourceIdempotencyKey != sidecar.SourceIdempotencyKey || value.SidecarFingerprint != sidecar.Fingerprint || value.SHA256 != sidecar.SHA256 {
+		return false, &Error{Code: CodeSidecarInvalid, Err: errors.New("media confirmation does not describe the current sidecar")}
+	}
+	if err := ensureSafePath(manager.config.MediaIngest.InboxDirectory, mediaPath, true); err != nil {
+		return false, err
+	}
+	sourceStamp, err := stampFile(mediaPath)
+	if err != nil || sourceStamp.size != sidecar.SizeBytes {
+		return false, &Error{Code: CodeStorageFailed, Err: errors.New("confirmed source media is missing or changed")}
+	}
+	claim, err := manager.repository.ResolveMediaClaim(ctx, value.CollectorID, value.SourceIdempotencyKey, value.SHA256, value.MetadataHash)
+	if err != nil {
+		return false, &Error{Code: CodeDatabaseFailed, Err: err}
+	}
+	if claim.Status != eventstore.MediaWriteDuplicate || claim.SegmentID != value.MediaSegmentID || claim.ManagedRelativePath == "" || claim.SidecarFingerprint != sidecar.Fingerprint {
+		return false, nil
+	}
+	source, err := hashFile(mediaPath, manager.config.MediaIngest.MaxSegmentBytes)
+	if err != nil || source.size != sidecar.SizeBytes || source.sha256 != sidecar.SHA256 {
+		return false, &Error{Code: CodeStorageFailed, Err: errors.New("confirmed source media failed verification")}
+	}
+	managedPath := filepath.Join(manager.storageRoot, filepath.FromSlash(claim.ManagedRelativePath))
+	if err := manager.verifyManagedFile(managedPath, sidecar.SizeBytes, sidecar.SHA256); err != nil {
+		return false, err
+	}
+	signature, err := manager.confirmationFileSignature(path)
+	if err != nil {
+		return false, err
+	}
+	ingestKey := hashText(strings.ToLower(filepath.Clean(manager.config.MediaIngest.InboxDirectory)) + "\x00" + filepath.Base(mediaPath))
+	if err := manager.repository.SaveMediaFileCheck(ctx, ingestKey, "confirmed", signature, manager.now().UTC().Format(time.RFC3339Nano)); err != nil {
+		return false, &Error{Code: CodeDatabaseFailed, Err: err}
+	}
+	return true, nil
+}
+
+func (manager *Manager) confirmationFileSignature(path string) (string, error) {
+	raw, err := manager.readInboxFile(path, manager.config.MediaIngest.MaxSidecarBytes)
+	if err != nil {
+		return "", err
+	}
+	if err := validateConfirmationJSON(raw); err != nil {
+		return "", err
+	}
+	var value confirmation
+	if err := json.Unmarshal(raw, &value); err != nil || value.SchemaVersion != StatusSchemaVersion || value.MediaSegmentID <= 0 {
+		return "", &Error{Code: CodeSidecarInvalid, Err: errors.New("media confirmation is invalid")}
+	}
+	acceptedAt, err := time.Parse(time.RFC3339Nano, value.AcceptedAtUTC)
+	_, offset := acceptedAt.Zone()
+	if err != nil || strings.TrimSpace(value.AcceptedAtUTC) != value.AcceptedAtUTC || strings.HasSuffix(value.AcceptedAtUTC, "-00:00") || offset != 0 {
+		return "", &Error{Code: CodeSidecarInvalid, Err: errors.New("media confirmation accepted_at_utc is invalid")}
+	}
+	mediaPath := strings.TrimSuffix(path, ConfirmationSuffix)
+	sidecarPath := mediaPath + SidecarSuffix
+	sidecarRaw, err := manager.readInboxFile(sidecarPath, manager.config.MediaIngest.MaxSidecarBytes)
+	if err != nil {
+		return "", err
+	}
+	sidecar, err := parseSidecar(sidecarRaw, manager.config.MediaMaxSegmentDuration())
+	if err != nil {
+		return "", err
+	}
+	if value.CollectorID != sidecar.CollectorID || value.SourceIdempotencyKey != sidecar.SourceIdempotencyKey || value.SidecarFingerprint != sidecar.Fingerprint || value.SHA256 != sidecar.SHA256 {
+		return "", &Error{Code: CodeSidecarInvalid, Err: errors.New("media confirmation does not describe the current sidecar")}
+	}
+	if err := ensureSafePath(manager.config.MediaIngest.InboxDirectory, mediaPath, true); err != nil {
+		return "", err
+	}
+	paths := []string{
+		path,
+		sidecarPath,
+		mediaPath,
+		filepath.Join(manager.acceptedRoot, sidecar.SHA256+".media"),
+	}
+	stamps := make([]fileStamp, 0, len(paths))
+	for _, candidatePath := range paths {
+		stamp, err := stampFile(candidatePath)
+		if err != nil {
+			return "", err
+		}
+		stamps = append(stamps, stamp)
+	}
+	if stamps[2].size != sidecar.SizeBytes || stamps[3].size != sidecar.SizeBytes {
+		return "", &Error{Code: CodeStorageFailed, Err: errors.New("confirmed media size changed")}
+	}
+	return hashText(hashBytes(raw) + "\x00" + sidecar.Fingerprint + "\x00" + fmt.Sprintf("%#v", stamps)), nil
+}
+
+func (manager *Manager) confirmationCached(ctx context.Context, path string) (bool, error) {
+	signature, err := manager.confirmationFileSignature(path)
+	if err != nil {
+		return false, nil
+	}
+	mediaPath := strings.TrimSuffix(path, ConfirmationSuffix)
+	ingestKey := hashText(strings.ToLower(filepath.Clean(manager.config.MediaIngest.InboxDirectory)) + "\x00" + filepath.Base(mediaPath))
+	matches, err := manager.repository.MediaFileCheckMatches(ctx, ingestKey, "confirmed", signature)
+	if err != nil {
+		return false, &Error{Code: CodeDatabaseFailed, Err: err}
+	}
+	return matches, nil
 }
 
 func validateConfirmationJSON(raw []byte) error {
-	if err := strictjson.ValidateExactRootObject(raw, 0, confirmationFields...); err != nil {
+	if err := strictjson.ValidateExactRootObjectRequired(raw, 0, confirmationFields...); err != nil {
 		return &Error{Code: CodeSidecarInvalid, Err: errors.New("media confirmation JSON is invalid")}
 	}
 	return nil

@@ -52,8 +52,14 @@ var sidecarFields = []string{
 }
 
 func parseSidecar(raw []byte, maxDuration time.Duration) (parsedSidecar, error) {
-	if err := strictjson.ValidateExactRootObject(raw, 0, sidecarFields...); err != nil {
+	if err := strictjson.ValidateExactRootObjectRequired(raw, 0, sidecarFields...); err != nil {
 		return parsedSidecar{}, &Error{Code: CodeSidecarInvalid, Err: errors.New("sidecar JSON does not match schema v1")}
+	}
+	var requiredTypes struct {
+		Complete *bool `json:"complete"`
+	}
+	if err := json.Unmarshal(raw, &requiredTypes); err != nil || requiredTypes.Complete == nil {
+		return parsedSidecar{}, &Error{Code: CodeSidecarInvalid, Err: errors.New("sidecar complete field must be a boolean")}
 	}
 	decoder := json.NewDecoder(bytes.NewReader(raw))
 	decoder.DisallowUnknownFields()

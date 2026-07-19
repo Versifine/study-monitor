@@ -2,8 +2,12 @@ package eventstore
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
+	"encoding/json"
 	"errors"
+	"strconv"
 )
 
 const (
@@ -53,6 +57,7 @@ type MediaClaim struct {
 	ManagedRelativePath string
 	SHA256              string
 	MetadataHash        string
+	SidecarFingerprint  string
 }
 
 type MediaIngestSummary struct {
@@ -77,11 +82,17 @@ func (store *Store) ResolveMediaClaim(ctx context.Context, collectorID, sourceKe
 
 func resolveMediaClaim(ctx context.Context, queryer rowQuerier, collectorID, sourceKey, sha256Value, metadataHash string) (MediaClaim, error) {
 	claim, err := queryMediaClaim(ctx, queryer, `
-SELECT ms.id, ms.managed_relative_path, ms.sha256, ms.metadata_hash
+SELECT ms.id, ms.managed_relative_path, ms.sha256, ms.metadata_hash,
+	   ms.sidecar_schema_version, ms.collector_id, ms.source_idempotency_key,
+	   ms.device_start_raw, ms.device_end_raw, ms.clock_offset_ms, ms.clock_error_ms,
+       ms.size_bytes, ms.media_type
 FROM media_segments AS ms
 WHERE ms.collector_id = ? AND ms.source_idempotency_key = ?
 UNION ALL
-SELECT ms.id, ms.managed_relative_path, ms.sha256, ms.metadata_hash
+SELECT ms.id, ms.managed_relative_path, ms.sha256, ms.metadata_hash,
+	   ms.sidecar_schema_version, mie.collector_id, mie.source_idempotency_key,
+       ms.device_start_raw, ms.device_end_raw, ms.clock_offset_ms, ms.clock_error_ms,
+       ms.size_bytes, ms.media_type
 FROM media_ingest_events AS mie
 JOIN media_segments AS ms ON ms.id = mie.media_segment_id
 WHERE mie.collector_id = ? AND mie.source_idempotency_key = ? AND mie.media_segment_id IS NOT NULL
@@ -100,7 +111,10 @@ LIMIT 1`, collectorID, sourceKey, collectorID, sourceKey)
 	}
 
 	claim, err = queryMediaClaim(ctx, queryer, `
-SELECT id, managed_relative_path, sha256, metadata_hash
+SELECT id, managed_relative_path, sha256, metadata_hash,
+       sidecar_schema_version, collector_id, source_idempotency_key,
+       device_start_raw, device_end_raw, clock_offset_ms, clock_error_ms,
+       size_bytes, media_type
 FROM media_segments
 WHERE sha256 = ?
 ORDER BY id
@@ -121,12 +135,44 @@ LIMIT 1`, sha256Value)
 
 func queryMediaClaim(ctx context.Context, queryer rowQuerier, query string, arguments ...any) (MediaClaim, error) {
 	var claim MediaClaim
+	var sidecar struct {
+		SchemaVersion        int    `json:"schema_version"`
+		Complete             bool   `json:"complete"`
+		CollectorID          string `json:"collector_id"`
+		SourceIdempotencyKey string `json:"source_idempotency_key"`
+		DeviceStartRaw       string `json:"device_start_raw"`
+		DeviceEndRaw         string `json:"device_end_raw"`
+		ClockOffsetMS        int64  `json:"clock_offset_ms"`
+		ClockErrorMS         int64  `json:"clock_error_ms"`
+		SizeBytes            int64  `json:"size_bytes"`
+		SHA256               string `json:"sha256"`
+		MediaType            string `json:"media_type"`
+	}
 	err := queryer.QueryRowContext(ctx, query, arguments...).Scan(
 		&claim.SegmentID,
 		&claim.ManagedRelativePath,
 		&claim.SHA256,
 		&claim.MetadataHash,
+		&sidecar.SchemaVersion,
+		&sidecar.CollectorID,
+		&sidecar.SourceIdempotencyKey,
+		&sidecar.DeviceStartRaw,
+		&sidecar.DeviceEndRaw,
+		&sidecar.ClockOffsetMS,
+		&sidecar.ClockErrorMS,
+		&sidecar.SizeBytes,
+		&sidecar.MediaType,
 	)
+	if err == nil {
+		sidecar.Complete = true
+		sidecar.SHA256 = claim.SHA256
+		raw, marshalErr := json.Marshal(sidecar)
+		if marshalErr != nil {
+			return MediaClaim{}, marshalErr
+		}
+		digest := sha256.Sum256(raw)
+		claim.SidecarFingerprint = hex.EncodeToString(digest[:])
+	}
 	return claim, err
 }
 
@@ -239,7 +285,54 @@ SELECT MAX(id) FROM media_segment_state_events WHERE media_segment_id = ?`, clai
 }
 
 func insertMediaIngestEvent(ctx context.Context, tx *sql.Tx, event MediaIngestEvent) (int64, error) {
-	_, err := tx.ExecContext(ctx, `
+	var previous struct {
+		id                    int64
+		collectorID           sql.NullString
+		sourceIdempotencyKey  sql.NullString
+		sourceName            string
+		sourceFingerprint     string
+		status                string
+		temporaryRelativePath sql.NullString
+		mediaSegmentID        sql.NullInt64
+		errorCode             sql.NullString
+	}
+	err := tx.QueryRowContext(ctx, `
+SELECT id, collector_id, source_idempotency_key, source_name, source_fingerprint,
+       status, temporary_relative_path, media_segment_id, error_code
+FROM media_ingest_events
+WHERE ingest_key = ?
+ORDER BY id DESC
+LIMIT 1`, event.IngestKey).Scan(
+		&previous.id,
+		&previous.collectorID,
+		&previous.sourceIdempotencyKey,
+		&previous.sourceName,
+		&previous.sourceFingerprint,
+		&previous.status,
+		&previous.temporaryRelativePath,
+		&previous.mediaSegmentID,
+		&previous.errorCode,
+	)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return 0, classifySQLiteError(CodeQueryFailed, "read previous media ingest event", err)
+	}
+	if err == nil {
+		if event.Status == "discovered" ||
+			(previous.collectorID.String == event.CollectorID &&
+				previous.sourceIdempotencyKey.String == event.SourceIdempotencyKey &&
+				previous.sourceName == event.SourceName &&
+				previous.sourceFingerprint == event.SourceFingerprint &&
+				previous.status == event.Status &&
+				previous.temporaryRelativePath.String == event.TemporaryRelativePath &&
+				previous.mediaSegmentID.Int64 == event.MediaSegmentID &&
+				previous.errorCode.String == event.ErrorCode) {
+			return previous.id, nil
+		}
+	}
+	predecessorID := previous.id
+	transitionDigest := sha256.Sum256([]byte(event.EventKey + "\x00" + strconv.FormatInt(predecessorID, 10)))
+	event.EventKey = hex.EncodeToString(transitionDigest[:])
+	_, err = tx.ExecContext(ctx, `
 INSERT INTO media_ingest_events (
     event_key, ingest_key, collector_id, source_idempotency_key, source_name,
     source_fingerprint, status, temporary_relative_path, media_segment_id,
@@ -381,6 +474,35 @@ LIMIT 1`).Scan(&summary.LastErrorCode); err != nil && !errors.Is(err, sql.ErrNoR
 		return summary, classifySQLiteError(CodeQueryFailed, "read latest media ingest error", err)
 	}
 	return summary, nil
+}
+
+func (store *Store) MediaFileCheckMatches(ctx context.Context, ingestKey, checkKind, signature string) (bool, error) {
+	var storedKind, storedSignature string
+	err := store.db.QueryRowContext(ctx, `
+SELECT check_kind, signature
+FROM media_file_checks
+WHERE ingest_key = ?`, ingestKey).Scan(&storedKind, &storedSignature)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, classifySQLiteError(CodeQueryFailed, "read media file check", err)
+	}
+	return storedKind == checkKind && storedSignature == signature, nil
+}
+
+func (store *Store) SaveMediaFileCheck(ctx context.Context, ingestKey, checkKind, signature, checkedAtUTC string) error {
+	_, err := store.db.ExecContext(ctx, `
+INSERT INTO media_file_checks (ingest_key, check_kind, signature, checked_at_utc)
+VALUES (?, ?, ?, ?)
+ON CONFLICT(ingest_key) DO UPDATE SET
+    check_kind = excluded.check_kind,
+    signature = excluded.signature,
+    checked_at_utc = excluded.checked_at_utc`, ingestKey, checkKind, signature, checkedAtUTC)
+	if err != nil {
+		return classifySQLiteError(CodeWriteFailed, "save media file check", err)
+	}
+	return nil
 }
 
 func nullableString(value string) any {

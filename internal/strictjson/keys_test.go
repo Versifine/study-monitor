@@ -75,3 +75,13 @@ func TestValidateExactRootObject(t *testing.T) {
 		t.Fatalf("zero-field schema error = %v, want unexpected key", err)
 	}
 }
+
+func TestValidateExactRootObjectRequired(t *testing.T) {
+	fields := []string{"schema_version", "complete"}
+	if err := ValidateExactRootObjectRequired([]byte(`{"schema_version":1,"complete":false}`), 1, fields...); err != nil {
+		t.Fatalf("complete required object = %v", err)
+	}
+	if err := ValidateExactRootObjectRequired([]byte(`{"schema_version":1}`), 1, fields...); !errors.Is(err, ErrMissingObjectKey) {
+		t.Fatalf("missing field error = %v, want missing key", err)
+	}
+}

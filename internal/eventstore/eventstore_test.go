@@ -43,7 +43,7 @@ func TestOpenMigratesNewDatabaseAndReopensIdempotently(t *testing.T) {
 	if err := store.db.QueryRow("SELECT COUNT(*) FROM media_schema_migrations").Scan(&mediaMigrationCount); err != nil {
 		t.Fatal(err)
 	}
-	if journalMode != "wal" || foreignKeys != 1 || busyTimeout != 5000 || migrationCount != 1 || mediaMigrationCount != 1 {
+	if journalMode != "wal" || foreignKeys != 1 || busyTimeout != 5000 || migrationCount != 1 || mediaMigrationCount != 2 {
 		t.Fatalf("pragmas/migrations = journal:%s foreign:%d busy:%d core:%d media:%d", journalMode, foreignKeys, busyTimeout, migrationCount, mediaMigrationCount)
 	}
 	if err := store.Close(); err != nil {
@@ -61,7 +61,7 @@ func TestOpenMigratesNewDatabaseAndReopensIdempotently(t *testing.T) {
 	if err := reopened.db.QueryRow("SELECT COUNT(*) FROM media_schema_migrations").Scan(&mediaMigrationCount); err != nil {
 		t.Fatal(err)
 	}
-	if mediaMigrationCount != 1 {
+	if mediaMigrationCount != 2 {
 		t.Fatalf("media migration count after reopen = %d", mediaMigrationCount)
 	}
 }

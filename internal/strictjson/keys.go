@@ -11,6 +11,7 @@ import (
 var (
 	ErrDuplicateObjectKey  = errors.New("JSON object contains a duplicate key")
 	ErrUnexpectedObjectKey = errors.New("JSON object contains an unexpected key")
+	ErrMissingObjectKey    = errors.New("JSON object is missing a required key")
 )
 
 type container struct {
@@ -33,6 +34,25 @@ func ValidateObjectKeys(raw []byte, checkedContainerDepth int) error {
 // encoding/json accepts case-insensitive struct field aliases.
 func ValidateExactRootObject(raw []byte, checkedContainerDepth int, allowedRootKeys ...string) error {
 	return validateObjectKeys(raw, checkedContainerDepth, allowedRootKeys, true)
+}
+
+// ValidateExactRootObjectRequired applies the exact-root validation and also
+// requires every listed root key to be present. It is intended for versioned
+// wire schemas whose fields are all mandatory.
+func ValidateExactRootObjectRequired(raw []byte, checkedContainerDepth int, requiredRootKeys ...string) error {
+	if err := ValidateExactRootObject(raw, checkedContainerDepth, requiredRootKeys...); err != nil {
+		return err
+	}
+	var root map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &root); err != nil {
+		return fmt.Errorf("decode JSON root object: %w", err)
+	}
+	for _, key := range requiredRootKeys {
+		if _, exists := root[key]; !exists {
+			return fmt.Errorf("%w: %q", ErrMissingObjectKey, key)
+		}
+	}
+	return nil
 }
 
 func validateObjectKeys(raw []byte, checkedContainerDepth int, allowedRootKeys []string, exactRootObject bool) error {

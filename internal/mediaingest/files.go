@@ -207,9 +207,22 @@ func (manager *Manager) quarantine(ctx context.Context, identity processIdentity
 	}
 	if _, err := os.Lstat(mediaTarget); errors.Is(err, os.ErrNotExist) {
 		if stagingPath != "" {
+			if err := ensureManagedPath(manager.storageRoot, stagingPath, true); err != nil {
+				_ = manager.record(ctx, identity, "failed", CodeQuarantineFailed, manager.relativeManaged(stagingPath), 0)
+				return &Error{Code: CodeQuarantineFailed, Err: errors.New("quarantine staging media is invalid")}
+			}
+			candidate, err := hashFile(stagingPath, manager.config.MediaIngest.MaxSegmentBytes)
+			if err != nil {
+				_ = manager.record(ctx, identity, "failed", CodeQuarantineFailed, manager.relativeManaged(stagingPath), 0)
+				return &Error{Code: CodeQuarantineFailed, Err: errors.New("quarantine staging media cannot be verified")}
+			}
 			if err := os.Rename(stagingPath, mediaTarget); err != nil {
 				_ = manager.record(ctx, identity, "failed", CodeQuarantineFailed, manager.relativeManaged(stagingPath), 0)
 				return &Error{Code: CodeQuarantineFailed, Err: errors.New("staging media cannot enter quarantine")}
+			}
+			if err := manager.verifyManagedFile(mediaTarget, candidate.size, candidate.sha256); err != nil {
+				_ = manager.record(ctx, identity, "failed", CodeQuarantineFailed, manager.relativeManaged(mediaTarget), 0)
+				return &Error{Code: CodeQuarantineFailed, Err: errors.New("committed quarantine media failed verification")}
 			}
 		} else {
 			temporary := filepath.Join(manager.quarantineRoot, base+".partial")
@@ -229,17 +242,41 @@ func (manager *Manager) quarantine(ctx context.Context, identity processIdentity
 				_ = manager.record(ctx, identity, "failed", CodeQuarantineFailed, "", 0)
 				return &Error{Code: CodeQuarantineFailed, Err: errors.New("quarantine media cannot be committed")}
 			}
+			if err := manager.verifyManagedFile(mediaTarget, result.size, result.sha256); err != nil {
+				_ = manager.record(ctx, identity, "failed", CodeQuarantineFailed, manager.relativeManaged(mediaTarget), 0)
+				return &Error{Code: CodeQuarantineFailed, Err: errors.New("committed quarantine media failed verification")}
+			}
 		}
 	} else if err != nil {
 		_ = manager.record(ctx, identity, "failed", CodeQuarantineFailed, "", 0)
 		return &Error{Code: CodeQuarantineFailed, Err: errors.New("quarantine target cannot be inspected")}
-	} else if stagingPath != "" {
+	} else {
+		var candidate copiedFile
+		if stagingPath != "" {
+			if err := ensureManagedPath(manager.storageRoot, stagingPath, true); err != nil {
+				_ = manager.record(ctx, identity, "failed", CodeQuarantineFailed, manager.relativeManaged(stagingPath), 0)
+				return &Error{Code: CodeQuarantineFailed, Err: errors.New("quarantine staging media is invalid")}
+			}
+			candidate, err = hashFile(stagingPath, manager.config.MediaIngest.MaxSegmentBytes)
+		} else {
+			if err := ensureSafePath(manager.config.MediaIngest.InboxDirectory, sourcePath, true); err != nil {
+				_ = manager.record(ctx, identity, "failed", CodeQuarantineFailed, "", 0)
+				return &Error{Code: CodeQuarantineFailed, Err: errors.New("quarantine source media is invalid")}
+			}
+			candidate, err = hashFile(sourcePath, manager.config.MediaIngest.MaxSegmentBytes)
+		}
+		if err != nil || manager.verifyManagedFile(mediaTarget, candidate.size, candidate.sha256) != nil {
+			_ = manager.record(ctx, identity, "failed", CodeQuarantineFailed, manager.relativeManaged(stagingPath), 0)
+			return &Error{Code: CodeQuarantineFailed, Err: errors.New("existing quarantine media does not match the current candidate")}
+		}
+	}
+	if stagingPath != "" {
 		if err := os.Remove(stagingPath); err != nil && !errors.Is(err, os.ErrNotExist) {
 			_ = manager.record(ctx, identity, "failed", CodeQuarantineFailed, manager.relativeManaged(stagingPath), 0)
 			return &Error{Code: CodeQuarantineFailed, Err: errors.New("redundant quarantine staging file cannot be removed")}
 		}
 	}
-	if len(sidecarRaw) > 0 {
+	if sidecarRaw != nil {
 		if err := writeAtomicFile(filepath.Join(manager.quarantineRoot, base+SidecarSuffix), sidecarRaw); err != nil {
 			_ = manager.record(ctx, identity, "failed", CodeQuarantineFailed, "", 0)
 			return &Error{Code: CodeQuarantineFailed, Err: err}
@@ -262,7 +299,10 @@ func (manager *Manager) quarantine(ctx context.Context, identity processIdentity
 		_ = manager.record(ctx, identity, "failed", CodeQuarantineFailed, "", 0)
 		return &Error{Code: CodeQuarantineFailed, Err: err}
 	}
-	return manager.record(ctx, identity, "quarantined", reasonCode, manager.relativeManaged(mediaTarget), 0)
+	if err := manager.record(ctx, identity, "quarantined", reasonCode, manager.relativeManaged(mediaTarget), 0); err != nil {
+		return err
+	}
+	return manager.rememberTerminal(ctx, identity, sourcePath)
 }
 
 func (manager *Manager) copyToQuarantine(sourcePath, targetPath string) (copiedFile, error) {
