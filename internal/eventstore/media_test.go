@@ -132,7 +132,7 @@ BEGIN SELECT RAISE(ABORT, 'FORCED_STATE_PROJECTION_FAILURE'); END;`); err != nil
 	assertTableCount(t, store.db, "media_segment_status", 1)
 }
 
-func TestVersionOneDatabaseMigratesForwardWithoutChangingRawEvents(t *testing.T) {
+func TestMediaMigrationKeepsCoreSchemaBackwardCompatible(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "events.db")
 	db := openRawDatabase(t, path)
 	migrations, err := repositoryMigrations()
@@ -155,10 +155,38 @@ clock_offset_ms, clock_error_ms, idempotency_key, payload_json, payload_hash, co
 		t.Fatal(err)
 	}
 	store := openTestStore(t, path)
-	defer store.Close()
 	assertTableCount(t, store.db, "raw_events", 1)
-	assertTableCount(t, store.db, "schema_migrations", 2)
+	assertTableCount(t, store.db, "schema_migrations", 1)
+	assertTableCount(t, store.db, "media_schema_migrations", 1)
 	assertTableCount(t, store.db, "media_segments", 0)
+	var schemaVersion int
+	if err := store.db.QueryRow("PRAGMA user_version").Scan(&schemaVersion); err != nil {
+		t.Fatal(err)
+	}
+	if schemaVersion != 1 {
+		t.Fatalf("core schema version = %d, want 1", schemaVersion)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	// This is the previous stable M1 migrator contract: it knows only the core
+	// ledger and schema version 1. Added media tables and their separate ledger
+	// must be safe to ignore during an application rollback.
+	rollbackDB := openRawDatabase(t, path)
+	coreMigrations, err := repositoryMigrations()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := applyMigrationsThrough(context.Background(), rollbackDB, coreMigrations, func() time.Time {
+		return time.Date(2026, 7, 18, 2, 0, 0, 0, time.UTC)
+	}, 1); err != nil {
+		t.Fatalf("previous core migrator rejected M2 database: %v", err)
+	}
+	assertTableCount(t, rollbackDB, "raw_events", 1)
+	if err := rollbackDB.Close(); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func testMediaMetadata(collector, sourceKey, sha, metadataHash string) MediaMetadata {

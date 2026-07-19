@@ -225,13 +225,13 @@ func TestManagerQuarantinesTruncatedAndInvalidProbeMedia(t *testing.T) {
 		mutate func(*Sidecar)
 	}{
 		{
-			name:   "truncated size mismatch",
+			name:   "declared size mismatch",
 			prober: fakeProber{},
 			mutate: func(sidecar *Sidecar) { sidecar.SizeBytes++ },
 		},
 		{
-			name:   "duration over limit",
-			prober: fakeProber{info: ProbeInfo{DurationMS: int64(11 * time.Minute / time.Millisecond), CodecName: "h264", FormatName: "mov,mp4", MediaType: "video"}},
+			name:   "duration one millisecond over limit",
+			prober: fakeProber{info: ProbeInfo{DurationMS: int64(10*time.Minute/time.Millisecond) + 1, CodecName: "h264", FormatName: "mov,mp4", MediaType: "video"}},
 		},
 		{
 			name:   "wrong media type",
@@ -252,6 +252,31 @@ func TestManagerQuarantinesTruncatedAndInvalidProbeMedia(t *testing.T) {
 				t.Fatalf("summary = %#v, %v", summary, err)
 			}
 		})
+	}
+}
+
+func TestManagerQuarantinesGenuinelyTruncatedFixture(t *testing.T) {
+	ffprobePath := requirePinnedFFprobe(t)
+	media := loadPinnedMediaFixture(t)
+	if len(media) <= 512 {
+		t.Fatalf("pinned fixture is unexpectedly short: %d bytes", len(media))
+	}
+	truncated := append([]byte(nil), media[:512]...)
+	manager, store, cfg := openTestManager(t, ExecProber{Path: ffprobePath})
+	defer store.Close()
+	segment := writeSegment(t, cfg.MediaIngest.InboxDirectory, "truncated.mp4", truncated, nil)
+
+	accepted, err := manager.ProcessReady(context.Background(), segment.readyPath)
+	if err != nil || accepted {
+		t.Fatalf("truncated ProcessReady() = %t, %v", accepted, err)
+	}
+	assertQuarantineReason(t, manager.quarantineRoot, CodeProbeFailed)
+	if _, err := os.Stat(segment.mediaPath); err != nil {
+		t.Fatalf("truncated source media was not preserved: %v", err)
+	}
+	summary, err := store.MediaIngestSummary(context.Background())
+	if err != nil || summary.Quarantined != 1 || summary.TotalSegments != 0 {
+		t.Fatalf("truncated summary = %#v, %v", summary, err)
 	}
 }
 
@@ -306,6 +331,111 @@ func TestManagerRetriesAfterInterruptedCopy(t *testing.T) {
 	if err != nil || summary.TotalSegments != 1 || summary.Accepted != 1 {
 		t.Fatalf("retry summary = %#v, %v", summary, err)
 	}
+}
+
+func TestManagerRecoversAfterAbruptProcessTermination(t *testing.T) {
+	tests := []struct {
+		name         string
+		mode         string
+		exitCode     int
+		wantPartial  int
+		wantAccepted int
+	}{
+		{name: "during staging copy", mode: "copy", exitCode: 91, wantPartial: 1},
+		{name: "after rename before database commit", mode: "rename", exitCode: 92, wantAccepted: 1},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			root := t.TempDir()
+			dataDirectory := filepath.Join(root, "data")
+			inboxDirectory := filepath.Join(root, "inbox")
+			if err := os.MkdirAll(inboxDirectory, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			segment := writeSegment(t, inboxDirectory, "abrupt.mp4", make([]byte, 160<<10), nil)
+			command := exec.Command(os.Args[0], "-test.run=^TestMediaIngestCrashHelper$")
+			command.Env = append(os.Environ(),
+				"EXAM_MONITOR_TEST_MEDIA_CRASH=1",
+				"EXAM_MONITOR_TEST_MEDIA_CRASH_MODE="+test.mode,
+				"EXAM_MONITOR_TEST_DATA_DIRECTORY="+dataDirectory,
+				"EXAM_MONITOR_TEST_INBOX_DIRECTORY="+inboxDirectory,
+			)
+			output, err := command.CombinedOutput()
+			var exitError *exec.ExitError
+			if !errors.As(err, &exitError) || exitError.ExitCode() != test.exitCode {
+				t.Fatalf("crash helper exit = %v, want %d\n%s", err, test.exitCode, output)
+			}
+
+			partial, err := filepath.Glob(filepath.Join(dataDirectory, "media", "staging", "*.partial"))
+			if err != nil || len(partial) != test.wantPartial {
+				t.Fatalf("partial files = %v, %v; want %d", partial, err, test.wantPartial)
+			}
+			acceptedFiles, err := filepath.Glob(filepath.Join(dataDirectory, "media", "accepted", "*.media"))
+			if err != nil || len(acceptedFiles) != test.wantAccepted {
+				t.Fatalf("accepted files = %v, %v; want %d", acceptedFiles, err, test.wantAccepted)
+			}
+			if _, err := os.Stat(segment.confirmationPath); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("confirmation exists after abrupt exit: %v", err)
+			}
+			if _, err := os.Stat(segment.mediaPath); err != nil {
+				t.Fatalf("source media missing after abrupt exit: %v", err)
+			}
+
+			cfg := crashTestConfig(t, dataDirectory, inboxDirectory)
+			store := openCrashTestStore(t, cfg)
+			defer store.Close()
+			beforeRetry, err := store.MediaIngestSummary(context.Background())
+			if err != nil || beforeRetry.TotalSegments != 0 {
+				t.Fatalf("summary before retry = %#v, %v", beforeRetry, err)
+			}
+			restarted := newManager(cfg, store, fakeProber{}, nil, fixedNow)
+			if err := restarted.Initialize(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+			processed, err := restarted.ProcessReady(context.Background(), segment.readyPath)
+			if err != nil || !processed {
+				t.Fatalf("restart retry ProcessReady() = %t, %v", processed, err)
+			}
+			afterRetry, err := store.MediaIngestSummary(context.Background())
+			if err != nil || afterRetry.TotalSegments != 1 || afterRetry.Accepted != 1 {
+				t.Fatalf("summary after retry = %#v, %v", afterRetry, err)
+			}
+			if _, err := os.Stat(segment.confirmationPath); err != nil {
+				t.Fatalf("confirmation missing after retry: %v", err)
+			}
+		})
+	}
+}
+
+func TestMediaIngestCrashHelper(t *testing.T) {
+	if os.Getenv("EXAM_MONITOR_TEST_MEDIA_CRASH") != "1" {
+		return
+	}
+	dataDirectory := os.Getenv("EXAM_MONITOR_TEST_DATA_DIRECTORY")
+	inboxDirectory := os.Getenv("EXAM_MONITOR_TEST_INBOX_DIRECTORY")
+	cfg := crashTestConfig(t, dataDirectory, inboxDirectory)
+	store := openCrashTestStore(t, cfg)
+	manager := newManager(cfg, store, fakeProber{}, nil, fixedNow)
+	if err := manager.Initialize(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	switch os.Getenv("EXAM_MONITOR_TEST_MEDIA_CRASH_MODE") {
+	case "copy":
+		manager.afterCopyChunk = func(int64) error {
+			os.Exit(91)
+			return nil
+		}
+	case "rename":
+		manager.afterRename = func(string) error {
+			os.Exit(92)
+			return nil
+		}
+	default:
+		t.Fatal("unknown crash helper mode")
+	}
+	readyPath := filepath.Join(inboxDirectory, "abrupt.mp4"+ReadySuffix)
+	_, _ = manager.ProcessReady(context.Background(), readyPath)
+	t.Fatal("crash hook was not reached")
 }
 
 func TestManagerRecoversTargetRenameFollowedByDatabaseFailure(t *testing.T) {
@@ -511,6 +641,43 @@ func uninitializedTestManager(t *testing.T, prober Prober) (*Manager, *eventstor
 		t.Fatal(err)
 	}
 	return newManager(cfg, store, prober, nil, fixedNow), store, cfg
+}
+
+func crashTestConfig(t *testing.T, dataDirectory, inboxDirectory string) config.Config {
+	t.Helper()
+	cfg, err := config.Load("", func(key string) (string, bool) {
+		if key == "LOCALAPPDATA" {
+			return filepath.Dir(dataDirectory), true
+		}
+		return "", false
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.Paths.DataDirectory = dataDirectory
+	cfg.MediaIngest.Enabled = true
+	cfg.MediaIngest.InboxDirectory = inboxDirectory
+	cfg.MediaIngest.SettleInterval = "1ms"
+	cfg.MediaIngest.ScanInterval = "10ms"
+	cfg.MediaIngest.FFprobePath = filepath.Join(filepath.Dir(dataDirectory), "ffprobe.exe")
+	return cfg
+}
+
+func openCrashTestStore(t *testing.T, cfg config.Config) *eventstore.Store {
+	t.Helper()
+	store, err := eventstore.Open(context.Background(), cfg.DatabasePath(), eventstore.Options{
+		BusyTimeout:        5 * time.Second,
+		MaxOpenConnections: 8,
+		MaxBatchEvents:     100,
+		MaxEventBytes:      64 << 10,
+		MaxPayloadDepth:    16,
+		MaxPageSize:        500,
+		Now:                fixedNow,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return store
 }
 
 func fixedNow() time.Time {

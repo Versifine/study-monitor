@@ -68,7 +68,7 @@ function Wait-ForReadiness {
         }
         try {
             $response = Invoke-RestMethod -Uri "$BaseURL/health/ready" -Method Get -TimeoutSec 1
-            if ($response.status -eq 'writable' -and $response.schema_version -eq 2) {
+            if ($response.status -eq 'writable' -and $response.schema_version -eq 1) {
                 return $response
             }
         }

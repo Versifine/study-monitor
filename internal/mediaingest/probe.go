@@ -62,9 +62,9 @@ func (prober ExecProber) Probe(ctx context.Context, mediaPath string, timeout ti
 	if err := decoder.Decode(&response); err != nil {
 		return ProbeInfo{}, &Error{Code: CodeProbeFailed, Err: errors.New("ffprobe JSON output is invalid")}
 	}
-	durationSeconds, err := strconv.ParseFloat(response.Format.Duration, 64)
-	if err != nil || math.IsNaN(durationSeconds) || math.IsInf(durationSeconds, 0) || durationSeconds <= 0 {
-		return ProbeInfo{}, &Error{Code: CodeDurationInvalid, Err: errors.New("ffprobe duration is invalid")}
+	durationMS, err := parseDurationMilliseconds(response.Format.Duration)
+	if err != nil {
+		return ProbeInfo{}, err
 	}
 	codec := ""
 	for _, stream := range response.Streams {
@@ -79,16 +79,24 @@ func (prober ExecProber) Probe(ctx context.Context, mediaPath string, timeout ti
 	if response.Format.FormatName == "" {
 		return ProbeInfo{}, &Error{Code: CodeProbeFailed, Err: errors.New("ffprobe format name is missing")}
 	}
-	durationMS := int64(math.Round(durationSeconds * 1000))
-	if durationMS <= 0 {
-		return ProbeInfo{}, &Error{Code: CodeDurationInvalid, Err: errors.New("ffprobe duration rounds to zero")}
-	}
 	return ProbeInfo{
 		DurationMS: durationMS,
 		CodecName:  codec,
 		FormatName: response.Format.FormatName,
 		MediaType:  "video",
 	}, nil
+}
+
+func parseDurationMilliseconds(value string) (int64, error) {
+	durationSeconds, err := strconv.ParseFloat(value, 64)
+	if err != nil || math.IsNaN(durationSeconds) || math.IsInf(durationSeconds, 0) || durationSeconds <= 0 {
+		return 0, &Error{Code: CodeDurationInvalid, Err: errors.New("ffprobe duration is invalid")}
+	}
+	durationMS := math.Ceil(durationSeconds * 1000)
+	if durationMS >= float64(uint64(1)<<63) {
+		return 0, &Error{Code: CodeDurationInvalid, Err: errors.New("ffprobe duration exceeds supported range")}
+	}
+	return int64(durationMS), nil
 }
 
 func runBoundedCommand(parent context.Context, timeout time.Duration, maximum int, name string, arguments ...string) ([]byte, error) {
