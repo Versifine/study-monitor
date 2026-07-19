@@ -4,10 +4,19 @@ param()
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 $repoRoot = Split-Path -Parent $PSScriptRoot
-$temporaryRoot = Join-Path ([IO.Path]::GetTempPath()) ("exam-monitor m1-smoke-" + [guid]::NewGuid().ToString('N'))
+$temporaryRoot = Join-Path ([IO.Path]::GetTempPath()) ("exam-monitor m2-smoke-" + [guid]::NewGuid().ToString('N'))
 $buildDirectory = Join-Path $temporaryRoot 'bin'
 $configPath = Join-Path $temporaryRoot 'config.json'
 $dataDirectory = Join-Path $temporaryRoot 'data'
+$mediaInbox = Join-Path $temporaryRoot 'media-inbox'
+$validMediaPath = Join-Path $mediaInbox 'valid.mp4'
+$validSidecarPath = $validMediaPath + '.sidecar.json'
+$validReadyPath = $validMediaPath + '.ready'
+$validConfirmationPath = $validMediaPath + '.accepted.json'
+$corruptMediaPath = Join-Path $mediaInbox 'corrupt.mp4'
+$corruptSidecarPath = $corruptMediaPath + '.sidecar.json'
+$corruptReadyPath = $corruptMediaPath + '.ready'
+$corruptConfirmationPath = $corruptMediaPath + '.accepted.json'
 $firstStdout = Join-Path $temporaryRoot 'first-stdout.log'
 $firstStderr = Join-Path $temporaryRoot 'first-stderr.log'
 $secondStdout = Join-Path $temporaryRoot 'second-stdout.log'
@@ -59,7 +68,7 @@ function Wait-ForReadiness {
         }
         try {
             $response = Invoke-RestMethod -Uri "$BaseURL/health/ready" -Method Get -TimeoutSec 1
-            if ($response.status -eq 'writable' -and $response.schema_version -eq 1) {
+            if ($response.status -eq 'writable' -and $response.schema_version -eq 2) {
                 return $response
             }
         }
@@ -68,6 +77,56 @@ function Wait-ForReadiness {
         }
     }
     throw 'writable readiness endpoint did not become available'
+}
+
+function Wait-ForMediaStatus {
+    param(
+        [Diagnostics.Process]$MonitorProcess,
+        [string]$BaseURL,
+        [scriptblock]$Predicate,
+        [string]$Description
+    )
+
+    $deadline = [DateTime]::UtcNow.AddSeconds(8)
+    while ([DateTime]::UtcNow -lt $deadline) {
+        if ($MonitorProcess.HasExited) {
+            break
+        }
+        try {
+            $status = Invoke-RestMethod -Uri "$BaseURL/api/v1/media/ingest/status" -Method Get -TimeoutSec 1
+            if (& $Predicate $status) {
+                return $status
+            }
+        }
+        catch {
+        }
+        Start-Sleep -Milliseconds 100
+    }
+    throw "media ingest did not reach $Description"
+}
+
+function Write-MediaSidecar {
+    param(
+        [string]$Path,
+        [long]$SizeBytes,
+        [string]$SHA256,
+        [string]$SourceKey
+    )
+
+    $sidecar = [ordered]@{
+        schema_version = 1
+        complete = $true
+        collector_id = 'smoke.ffmpeg'
+        source_idempotency_key = $SourceKey
+        device_start_raw = '2026-07-19T10:00:00+08:00'
+        device_end_raw = '2026-07-19T10:00:01+08:00'
+        clock_offset_ms = 0
+        clock_error_ms = 25
+        size_bytes = $SizeBytes
+        sha256 = $SHA256
+        media_type = 'video'
+    }
+    Write-Utf8WithoutBOM -Path $Path -Contents ($sidecar | ConvertTo-Json -Depth 4)
 }
 
 function Invoke-EventBatch {
@@ -103,6 +162,25 @@ function Assert-CleanProcessStop {
 
 try {
     [void](New-Item -ItemType Directory -Path $temporaryRoot)
+    [void](New-Item -ItemType Directory -Path $mediaInbox)
+    $ffprobeCommand = Get-Command ffprobe -CommandType Application -ErrorAction Stop | Select-Object -First 1
+    $ffprobePath = $ffprobeCommand.Source
+    $ffprobeVersionLine = (& $ffprobePath -version | Select-Object -First 1)
+    $expectedFFprobeVersion = 'N-117599-ge1d1ba4cbc-20241017'
+    if ($ffprobeVersionLine -notmatch '^ffprobe version ([^ ]+) ' -or $Matches[1] -ne $expectedFFprobeVersion) {
+        throw "M2 requires ffprobe $expectedFFprobeVersion; found: $ffprobeVersionLine"
+    }
+
+    $fixtureEncoded = (Get-Content -LiteralPath (Join-Path $repoRoot 'testdata\media\valid.mp4.b64') -Raw -Encoding UTF8).Trim()
+    $fixtureBytes = [Convert]::FromBase64String($fixtureEncoded)
+    [IO.File]::WriteAllBytes($validMediaPath, $fixtureBytes)
+    $fixtureSHA256 = (Get-FileHash -LiteralPath $validMediaPath -Algorithm SHA256).Hash.ToLowerInvariant()
+    if ($fixtureBytes.Length -ne 2195 -or $fixtureSHA256 -ne '346f4da339e0f6f91e1785436c74f97a42b87392e6f4939b2fc01b5e12f442d8') {
+        throw 'M2 fixed media fixture size or SHA-256 changed'
+    }
+    Write-MediaSidecar -Path $validSidecarPath -SizeBytes $fixtureBytes.Length -SHA256 $fixtureSHA256 -SourceKey 'm2-smoke-valid-1'
+    [IO.File]::WriteAllBytes($validReadyPath, [byte[]]@())
+
     $binaryPath = ((& (Join-Path $PSScriptRoot 'build.ps1') -OutputDirectory $buildDirectory) | Select-Object -Last 1)
     if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $binaryPath -PathType Leaf)) {
         throw 'smoke build did not produce exam-monitor.exe'
@@ -132,6 +210,18 @@ try {
             default_page_size = 100
             max_page_size = 500
         }
+        media_ingest = [ordered]@{
+            enabled = $true
+            inbox_directory = $mediaInbox
+            scan_interval = '100ms'
+            settle_interval = '100ms'
+            max_segment_bytes = 1048576
+            max_segment_duration = '10m'
+            max_sidecar_bytes = 65536
+            max_scan_entries = 1000
+            ffprobe_path = $ffprobePath
+            ffprobe_timeout = '5s'
+        }
         logging = [ordered]@{ level = 'info' }
     }
     Write-Utf8WithoutBOM -Path $configPath -Contents ($config | ConvertTo-Json -Depth 6)
@@ -142,14 +232,14 @@ try {
     }
     $check = $checkJSON | ConvertFrom-Json
     $expectedDatabase = Join-Path $dataDirectory 'exam-monitor.db'
-    if ($check.status -ne 'ok' -or $check.data_directory -ne $dataDirectory -or $check.database_path -ne $expectedDatabase) {
+    if ($check.status -ne 'ok' -or $check.data_directory -ne $dataDirectory -or $check.database_path -ne $expectedDatabase -or -not $check.media_ingest_enabled -or $check.media_inbox_directory -ne $mediaInbox -or $check.ffprobe_path -ne $ffprobePath) {
         throw "unexpected --check-config output: $checkJSON"
     }
     if (Test-Path -LiteralPath $dataDirectory) {
         throw '--check-config created the runtime data directory'
     }
 
-    $process = Start-MonitorProcess -BinaryPath $binaryPath -ConfigurationPath $configPath -StandardOutput $firstStdout -StandardError $firstStderr -RunFor '8s'
+    $process = Start-MonitorProcess -BinaryPath $binaryPath -ConfigurationPath $configPath -StandardOutput $firstStdout -StandardError $firstStderr -RunFor '10s'
     [void](Wait-ForReadiness -MonitorProcess $process -BaseURL $baseURL)
 
     $event = [ordered]@{
@@ -192,22 +282,98 @@ try {
     if ($query.schema_version -ne 1 -or $query.events.Count -ne 1 -or $query.events[0].id -ne $eventID -or $query.events[0].payload.window -ne 'notes') {
         throw "unexpected event query: $($query | ConvertTo-Json -Depth 8 -Compress)"
     }
+
+    $mediaAccepted = Wait-ForMediaStatus -MonitorProcess $process -BaseURL $baseURL -Description 'one accepted segment' -Predicate {
+        param($status)
+        $status.status -eq 'healthy' -and
+            $status.ffprobe_version -eq $expectedFFprobeVersion -and
+            $status.ingest.accepted -eq 1 -and
+            $status.ingest.total_segments -eq 1 -and
+            $status.ingest.backlog -eq 0
+    }
+    if (-not (Test-Path -LiteralPath $validConfirmationPath -PathType Leaf)) {
+        throw 'accepted media confirmation marker was not created'
+    }
+    if (-not (Test-Path -LiteralPath $validMediaPath -PathType Leaf)) {
+        throw 'Recorder Core removed the source media before collector confirmation'
+    }
+    $firstConfirmation = Get-Content -LiteralPath $validConfirmationPath -Raw -Encoding UTF8 | ConvertFrom-Json
+    if ($firstConfirmation.media_segment_id -le 0 -or $firstConfirmation.sha256 -ne $fixtureSHA256) {
+        throw 'accepted media confirmation has unexpected identity or checksum'
+    }
+    $acceptedMediaPath = Join-Path $dataDirectory ("media\accepted\$fixtureSHA256.media")
+    if (-not (Test-Path -LiteralPath $acceptedMediaPath -PathType Leaf)) {
+        throw 'accepted media is missing from Recorder Core managed storage'
+    }
+    if ((Get-FileHash -LiteralPath $acceptedMediaPath -Algorithm SHA256).Hash.ToLowerInvariant() -ne $fixtureSHA256) {
+        throw 'managed accepted media checksum does not match the sidecar'
+    }
+
+    Remove-Item -LiteralPath $validConfirmationPath -Force
+    [void](Wait-ForMediaStatus -MonitorProcess $process -BaseURL $baseURL -Description 'idempotent confirmation replay' -Predicate {
+        param($status)
+        (Test-Path -LiteralPath $validConfirmationPath -PathType Leaf) -and
+            $status.ingest.accepted -eq 1 -and
+            $status.ingest.total_segments -eq 1
+    })
+    $replayedConfirmation = Get-Content -LiteralPath $validConfirmationPath -Raw -Encoding UTF8 | ConvertFrom-Json
+    if ($replayedConfirmation.media_segment_id -ne $firstConfirmation.media_segment_id) {
+        throw 'media replay returned a different media segment id'
+    }
+
+    Copy-Item -LiteralPath $validMediaPath -Destination $corruptMediaPath
+    Write-MediaSidecar -Path $corruptSidecarPath -SizeBytes $fixtureBytes.Length -SHA256 ('0' * 64) -SourceKey 'm2-smoke-corrupt-1'
+    [IO.File]::WriteAllBytes($corruptReadyPath, [byte[]]@())
+    $mediaQuarantined = Wait-ForMediaStatus -MonitorProcess $process -BaseURL $baseURL -Description 'checksum mismatch quarantine' -Predicate {
+        param($status)
+        $status.ingest.quarantined -eq 1 -and
+            $status.ingest.total_segments -eq 1 -and
+            $status.ingest.last_error_code -eq 'MEDIA_HASH_MISMATCH'
+    }
+    if (Test-Path -LiteralPath $corruptConfirmationPath) {
+        throw 'quarantined media received an accepted confirmation'
+    }
+    if (-not (Test-Path -LiteralPath $corruptMediaPath -PathType Leaf)) {
+        throw 'quarantine removed the unconfirmed source media'
+    }
+    $reasonFiles = @(Get-ChildItem -LiteralPath (Join-Path $dataDirectory 'media\quarantine') -Filter '*.reason.json' -File)
+    if ($reasonFiles.Count -ne 1) {
+        throw "expected one managed quarantine reason, found $($reasonFiles.Count)"
+    }
+    $reason = Get-Content -LiteralPath $reasonFiles[0].FullName -Raw -Encoding UTF8 | ConvertFrom-Json
+    if ($reason.reason_code -ne 'MEDIA_HASH_MISMATCH') {
+        throw "unexpected quarantine reason: $($reason.reason_code)"
+    }
     Assert-CleanProcessStop -MonitorProcess $process -StandardError $firstStderr
     $process = $null
 
-    $process = Start-MonitorProcess -BinaryPath $binaryPath -ConfigurationPath $configPath -StandardOutput $secondStdout -StandardError $secondStderr -RunFor '4s'
+    $process = Start-MonitorProcess -BinaryPath $binaryPath -ConfigurationPath $configPath -StandardOutput $secondStdout -StandardError $secondStderr -RunFor '8s'
     [void](Wait-ForReadiness -MonitorProcess $process -BaseURL $baseURL)
     $restartQuery = Invoke-RestMethod -Uri "$baseURL/api/v1/events?limit=10" -Method Get -TimeoutSec 3
     if ($restartQuery.events.Count -ne 1 -or $restartQuery.events[0].id -ne $eventID -or $restartQuery.events[0].idempotency_key -ne 'm1-smoke-event-1') {
         throw "confirmed event missing after restart: $($restartQuery | ConvertTo-Json -Depth 8 -Compress)"
     }
+    $restartMedia = Wait-ForMediaStatus -MonitorProcess $process -BaseURL $baseURL -Description 'persisted media state after restart' -Predicate {
+        param($status)
+        $status.status -eq 'healthy' -and
+            $status.ingest.accepted -eq 1 -and
+            $status.ingest.quarantined -eq 1 -and
+            $status.ingest.total_segments -eq 1
+    }
+    $restartConfirmation = Get-Content -LiteralPath $validConfirmationPath -Raw -Encoding UTF8 | ConvertFrom-Json
+    if ($restartConfirmation.media_segment_id -ne $firstConfirmation.media_segment_id -or
+        -not (Test-Path -LiteralPath $acceptedMediaPath -PathType Leaf) -or
+        -not (Test-Path -LiteralPath $validMediaPath -PathType Leaf) -or
+        -not (Test-Path -LiteralPath $corruptMediaPath -PathType Leaf)) {
+        throw 'media acceptance, confirmation, quarantine, or source preservation did not survive restart'
+    }
     Assert-CleanProcessStop -MonitorProcess $process -StandardError $secondStderr
     $process = $null
 
     if (-not (Test-Path -LiteralPath $expectedDatabase -PathType Leaf)) {
-        throw 'M1 smoke database was not created in the temporary data directory'
+        throw 'M2 smoke database was not created in the temporary data directory'
     }
-    Write-Output "M1 smoke passed: write, replay, conflict, query, restart query ($baseURL)"
+    Write-Output "M2 smoke passed: M1 event path plus media import, replay, quarantine, source preservation, and restart recovery ($baseURL)"
 }
 catch {
     foreach ($logPath in @($firstStderr, $secondStderr)) {
@@ -222,7 +388,15 @@ finally {
         Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue
         [void]$process.WaitForExit(5000)
     }
-    if (Test-Path -LiteralPath $temporaryRoot) {
-        Remove-Item -LiteralPath $temporaryRoot -Recurse -Force
+    for ($attempt = 0; $attempt -lt 3 -and (Test-Path -LiteralPath $temporaryRoot); $attempt++) {
+        try {
+            Remove-Item -LiteralPath $temporaryRoot -Recurse -Force -ErrorAction Stop
+        }
+        catch {
+            if ($attempt -eq 2) {
+                throw
+            }
+            Start-Sleep -Milliseconds 100
+        }
     }
 }

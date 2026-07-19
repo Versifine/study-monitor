@@ -40,6 +40,15 @@ func TestLoadDefaultsAreSafe(t *testing.T) {
 		cfg.API.MaxPayloadDepth != 16 || cfg.API.MaxConcurrentWrites != 4 || cfg.API.DefaultPageSize != 100 || cfg.API.MaxPageSize != 500 {
 		t.Fatalf("unsafe API defaults: %+v", cfg.API)
 	}
+	if cfg.MediaIngest.Enabled || cfg.MediaIngest.InboxDirectory != filepath.Join(wantDataDirectory, "media-inbox") ||
+		cfg.MediaIngest.MaxSegmentBytes != 2<<30 || cfg.MediaMaxSegmentDuration() != 10*time.Minute ||
+		cfg.MediaIngest.MaxSidecarBytes != 64<<10 || cfg.MediaIngest.MaxScanEntries != 1000 ||
+		cfg.MediaScanInterval() != time.Second || cfg.MediaSettleInterval() != time.Second || cfg.FFprobeTimeout() != 30*time.Second {
+		t.Fatalf("unsafe media defaults: %+v", cfg.MediaIngest)
+	}
+	if cfg.MediaStorageDirectory() != filepath.Join(wantDataDirectory, "media") {
+		t.Fatalf("MediaStorageDirectory = %q", cfg.MediaStorageDirectory())
+	}
 	if cfg.DatabasePath() != filepath.Join(wantDataDirectory, "exam-monitor.db") {
 		t.Fatalf("DatabasePath = %q", cfg.DatabasePath())
 	}
@@ -80,6 +89,16 @@ func TestLoadEnvironmentOverridesFile(t *testing.T) {
 		EnvMaxWrites:        "3",
 		EnvDefaultPageSize:  "25",
 		EnvMaxPageSize:      "250",
+		EnvMediaEnabled:     "true",
+		EnvMediaInbox:       `D:\media-inbox`,
+		EnvMediaScan:        "2s",
+		EnvMediaSettle:      "3s",
+		EnvMediaMaxBytes:    "10485760",
+		EnvMediaMaxDuration: "5m",
+		EnvMediaSidecar:     "32768",
+		EnvMediaScanEntries: "250",
+		EnvFFprobePath:      `D:\tools\ffprobe.exe`,
+		EnvFFprobeTimeout:   "20s",
 	})
 	cfg, err := Load(path, lookup)
 	if err != nil {
@@ -98,6 +117,12 @@ func TestLoadEnvironmentOverridesFile(t *testing.T) {
 		cfg.API.MaxRequestBytes != 2097152 || cfg.API.MaxBatchEvents != 50 || cfg.API.MaxEventBytes != 32768 ||
 		cfg.API.MaxPayloadDepth != 12 || cfg.API.MaxConcurrentWrites != 3 || cfg.API.DefaultPageSize != 25 || cfg.API.MaxPageSize != 250 {
 		t.Fatalf("environment override not applied: %+v", cfg)
+	}
+	if !cfg.MediaIngest.Enabled || cfg.MediaIngest.InboxDirectory != `D:\media-inbox` || cfg.MediaScanInterval() != 2*time.Second ||
+		cfg.MediaSettleInterval() != 3*time.Second || cfg.MediaIngest.MaxSegmentBytes != 10485760 || cfg.MediaMaxSegmentDuration() != 5*time.Minute ||
+		cfg.MediaIngest.MaxSidecarBytes != 32768 || cfg.MediaIngest.MaxScanEntries != 250 ||
+		cfg.MediaIngest.FFprobePath != `D:\tools\ffprobe.exe` || cfg.FFprobeTimeout() != 20*time.Second {
+		t.Fatalf("media environment override not applied: %+v", cfg.MediaIngest)
 	}
 }
 
@@ -158,6 +183,10 @@ func TestLoadRejectsInvalidInput(t *testing.T) {
 	}{
 		{name: "missing schema", json: `{}`, code: CodeMissingSchema},
 		{name: "unknown field", json: `{"schema_version":1,"extra":true}`, code: CodeDecodeFailed},
+		{name: "case variant root field", json: `{"schema_version":1,"Logging":{"level":"debug"}}`, code: CodeDecodeFailed},
+		{name: "duplicate root field", json: `{"schema_version":1,"logging":{},"logging":{"level":"debug"}}`, code: CodeDecodeFailed},
+		{name: "case variant nested field", json: `{"schema_version":1,"media_ingest":{"Enabled":true}}`, code: CodeDecodeFailed},
+		{name: "duplicate nested field", json: `{"schema_version":1,"media_ingest":{"enabled":false,"enabled":true}}`, code: CodeDecodeFailed},
 		{name: "trailing value", json: `{"schema_version":1} {}`, code: CodeDecodeFailed},
 		{name: "unsupported schema", json: `{"schema_version":2}`, code: CodeUnsupportedSchema},
 		{name: "hostname instead of IP", json: `{"schema_version":1,"server":{"listen_address":"localhost:47831"}}`, code: CodeInvalidAddress},
@@ -174,6 +203,10 @@ func TestLoadRejectsInvalidInput(t *testing.T) {
 		{name: "small request limit", json: `{"schema_version":1,"api":{"max_request_bytes":1024}}`, code: CodeInvalidAPILimit},
 		{name: "event limit exceeds request", json: `{"schema_version":1,"api":{"max_request_bytes":65536,"max_event_bytes":65536}}`, code: CodeInvalidAPILimit},
 		{name: "page default exceeds maximum", json: `{"schema_version":1,"api":{"default_page_size":501,"max_page_size":500}}`, code: CodeInvalidAPILimit},
+		{name: "media duration exceeds ten minutes", json: `{"schema_version":1,"media_ingest":{"max_segment_duration":"11m"}}`, code: CodeInvalidMedia},
+		{name: "media storage overlap", json: `{"schema_version":1,"media_ingest":{"inbox_directory":"media"}}`, code: CodeInvalidMedia},
+		{name: "enabled media relative ffprobe", json: `{"schema_version":1,"media_ingest":{"enabled":true,"ffprobe_path":"ffprobe.exe"}}`, code: CodeInvalidMedia},
+		{name: "small media sidecar limit", json: `{"schema_version":1,"media_ingest":{"max_sidecar_bytes":128}}`, code: CodeInvalidMedia},
 	}
 
 	for _, test := range tests {

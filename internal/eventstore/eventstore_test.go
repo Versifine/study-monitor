@@ -40,7 +40,7 @@ func TestOpenMigratesNewDatabaseAndReopensIdempotently(t *testing.T) {
 	if err := store.db.QueryRow("SELECT COUNT(*) FROM schema_migrations").Scan(&migrationCount); err != nil {
 		t.Fatal(err)
 	}
-	if journalMode != "wal" || foreignKeys != 1 || busyTimeout != 5000 || migrationCount != 1 {
+	if journalMode != "wal" || foreignKeys != 1 || busyTimeout != 5000 || migrationCount != 2 {
 		t.Fatalf("pragmas/migrations = journal:%s foreign:%d busy:%d migrations:%d", journalMode, foreignKeys, busyTimeout, migrationCount)
 	}
 	if err := store.Close(); err != nil {
@@ -52,7 +52,7 @@ func TestOpenMigratesNewDatabaseAndReopensIdempotently(t *testing.T) {
 	if err := reopened.db.QueryRow("SELECT COUNT(*) FROM schema_migrations").Scan(&migrationCount); err != nil {
 		t.Fatal(err)
 	}
-	if migrationCount != 1 {
+	if migrationCount != 2 {
 		t.Fatalf("migration count after reopen = %d", migrationCount)
 	}
 }
@@ -73,7 +73,7 @@ func TestOpenRejectsUnsupportedAndModifiedMigrations(t *testing.T) {
 	t.Run("newer schema", func(t *testing.T) {
 		path := filepath.Join(t.TempDir(), "newer.db")
 		db := openRawDatabase(t, path)
-		if _, err := db.Exec("PRAGMA user_version = 2"); err != nil {
+		if _, err := db.Exec("PRAGMA user_version = 3"); err != nil {
 			t.Fatal(err)
 		}
 		db.Close()

@@ -1,6 +1,6 @@
-# M1 本地 API
+# M1-M2 本地 API
 
-本文冻结 M1 的仅追加事件写入、查询和健康接口。所有接口默认只监听 loopback；M1 不包含媒体上传、ActivityWatch 适配、覆盖率、前端、AI 或复杂认证。
+本文冻结 M1 的仅追加事件写入、查询和健康接口，以及 M2 的媒体入口状态接口。所有接口默认只监听 loopback；媒体数据面使用受管文件入口而不是 HTTP 上传。M2 不包含 ActivityWatch 适配、覆盖率、前端、AI 或复杂认证。
 
 ## 1. 通用规则
 
@@ -90,7 +90,17 @@
 
 存储初始化失败时 `/health/live` 仍可用，但写入和查询返回存储不可用；系统不会伪造成功确认。
 
-## 5. 默认限制
+## 5. 媒体入口状态
+
+`GET|HEAD /api/v1/media/ingest/status`
+
+该只读端点返回媒体模块的 `disabled`、`healthy` 或 `unavailable` 状态、固定 ffprobe 版本、最后扫描时间、入口未确认 ready 数量和字节估算，以及从仅追加事实重建的导入状态摘要。完整响应 schema 和字段语义见 [`MEDIA_INGEST.md`](MEDIA_INGEST.md)。
+
+媒体模块缺失工具、版本不匹配或普通导入失败时，该端点仍返回 HTTP 200 和可见状态；这些故障不改变 M1 事件存储的 `/health/ready`。客户端不能把状态查询的 HTTP 200 解释为媒体健康，必须检查响应中的 `status`。
+
+只接受 GET 和 HEAD；其他方法返回 405。
+
+## 6. 默认限制
 
 | 配置 | 默认值 |
 |---|---:|
@@ -103,5 +113,9 @@
 | `api.max_page_size` | 500 |
 | `storage.busy_timeout` | 5 秒 |
 | `storage.max_open_connections` | 8 |
+| `media_ingest.max_segment_bytes` | 2 GiB |
+| `media_ingest.max_segment_duration` | 10 分钟 |
+| `media_ingest.max_sidecar_bytes` | 64 KiB |
+| `media_ingest.max_scan_entries` | 1000 |
 
 生产数据库路径是 `<data_directory>/exam-monitor.db`。`--check-config` 只输出解析后的路径和配置摘要，不创建目录或数据库。

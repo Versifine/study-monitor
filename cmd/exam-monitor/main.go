@@ -84,6 +84,10 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer, lookup co
 			DataDirectory string `json:"data_directory"`
 			DatabasePath  string `json:"database_path"`
 			LogLevel      string `json:"log_level"`
+			MediaEnabled  bool   `json:"media_ingest_enabled"`
+			MediaInbox    string `json:"media_inbox_directory"`
+			MediaStorage  string `json:"media_storage_directory"`
+			FFprobePath   string `json:"ffprobe_path,omitempty"`
 		}{
 			Status:        "ok",
 			SchemaVersion: cfg.SchemaVersion,
@@ -91,6 +95,10 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer, lookup co
 			DataDirectory: cfg.Paths.DataDirectory,
 			DatabasePath:  cfg.DatabasePath(),
 			LogLevel:      cfg.Logging.Level,
+			MediaEnabled:  cfg.MediaIngest.Enabled,
+			MediaInbox:    cfg.MediaIngest.InboxDirectory,
+			MediaStorage:  cfg.MediaStorageDirectory(),
+			FFprobePath:   cfg.MediaIngest.FFprobePath,
 		}
 		if err := writeJSON(stdout, result); err != nil {
 			logger.Error("cli", "config_output_failed", "CLI_OUTPUT_FAILED", "write config validation output", err)

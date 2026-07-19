@@ -68,6 +68,8 @@ ActivityWatch、FFmpeg 兼容录像器和未来其他采集器负责原始采集
 
 ## 5. 受管媒体导入边界
 
+M2 已冻结的来源文件名、sidecar schema、确认、错误码和状态接口详见 [`MEDIA_INGEST.md`](MEDIA_INGEST.md)。
+
 Version 1 只支持受管导入，不支持“登记一个可能被外部程序随时移动的任意路径”作为已接受证据。
 
 1. 外部采集器完成分段后，发布媒体、版本化 sidecar 和就绪标记；仍在增长的文件不进入处理。

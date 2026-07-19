@@ -48,9 +48,13 @@
 
 已接受记录不因文件保留操作而删除或改写。`media_segments` 只在受管文件已经落盘并校验成功后插入；发现一个来源文件不等于创建已接受媒体。
 
+M2 的唯一来源身份为 `(collector_id, source_idempotency_key)`；`sha256` 支持相同内容查重，`metadata_hash` 覆盖设备原始/UTC 时间、时钟质量、大小、ffprobe 时长/编码/格式、媒体类型、校验和和 sidecar 版本。受管相对路径固定指向 `media/accepted/<sha256>.media`，不保存或长期引用入口绝对路径。完整文件合同见 [`MEDIA_INGEST.md`](MEDIA_INGEST.md)。
+
 ### media_ingest_events
 
 追加式保存媒体导入尝试：来源幂等键、来源文件指纹、`discovered`、`pending`、`validated`、`quarantined`、`accepted` 或 `failed`、临时文件引用、稳定错误码和发生时间。它用于中断恢复与积压/故障展示，不把尚未完成或损坏的来源文件伪装成已接受 Evidence。
+
+M2 使用稳定 `event_key` 抑制同一阶段重试产生的重复事实；投影按同一 `ingest_key` 的最大事件 ID 重建当前状态。入口中无有效确认的 `.ready` 文件数量和字节估算来自文件系统扫描，不与数据库 pending 投影重复相加。
 
 ### media_segment_state_events
 

@@ -9,6 +9,8 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -157,6 +159,81 @@ func TestServeStopsCleanlyWhenContextIsCanceled(t *testing.T) {
 	}
 	if !bytes.Contains(logs.Bytes(), []byte(`"event":"stopped"`)) {
 		t.Fatalf("stopped event missing from logs: %s", logs.String())
+	}
+}
+
+func TestMissingFFprobeDisablesOnlyMediaIngest(t *testing.T) {
+	probe, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	address := probe.Addr().String()
+	if err := probe.Close(); err != nil {
+		t.Fatal(err)
+	}
+	cfg := loadTestConfig(t)
+	cfg.Server.ListenAddress = address
+	cfg.MediaIngest.Enabled = true
+	cfg.MediaIngest.InboxDirectory = filepath.Join(t.TempDir(), "inbox")
+	cfg.MediaIngest.FFprobePath = filepath.Join(t.TempDir(), "missing-ffprobe.exe")
+	var logs bytes.Buffer
+	logger, err := logging.New(&logs, "info", "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- Run(ctx, cfg, logger, version.Info{Version: "test"}) }()
+	baseURL := "http://" + address
+	waitForLiveness(t, baseURL+"/health/live")
+
+	client := &http.Client{Timeout: time.Second}
+	request, err := http.NewRequest(http.MethodPost, baseURL+"/api/v1/events/batch", strings.NewReader(`{"schema_version":1,"events":[{"schema_version":1,"collector_id":"desktop","event_type":"study.activity","device_timestamp_raw":"2026-07-18T10:00:00+08:00","clock_offset_ms":0,"clock_error_ms":10,"idempotency_key":"media-disabled-event","payload":{}}]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.Header.Set("Content-Type", "application/json")
+	response, err := client.Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ := io.ReadAll(response.Body)
+	_ = response.Body.Close()
+	if response.StatusCode != http.StatusOK || !bytes.Contains(body, []byte(`"status":"accepted"`)) {
+		t.Fatalf("event write while media unavailable: status=%d body=%s", response.StatusCode, body)
+	}
+
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		response, err = client.Get(baseURL + "/api/v1/media/ingest/status")
+		if err == nil {
+			body, _ = io.ReadAll(response.Body)
+			_ = response.Body.Close()
+			if bytes.Contains(body, []byte(`"status":"unavailable"`)) {
+				break
+			}
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("media status did not become unavailable: %s", body)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	response, err = client.Get(baseURL + "/health/ready")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("core readiness changed after ffprobe failure: %d", response.StatusCode)
+	}
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Run() did not stop")
 	}
 }
 

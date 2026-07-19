@@ -14,6 +14,7 @@ import (
 	"github.com/Versifine/study-monitor/internal/config"
 	"github.com/Versifine/study-monitor/internal/eventstore"
 	"github.com/Versifine/study-monitor/internal/logging"
+	"github.com/Versifine/study-monitor/internal/mediaingest"
 	"github.com/Versifine/study-monitor/internal/strictjson"
 	"github.com/Versifine/study-monitor/internal/version"
 )
@@ -45,6 +46,10 @@ type Store interface {
 	Readiness(context.Context) eventstore.Readiness
 }
 
+type MediaStatusProvider interface {
+	Status(context.Context) mediaingest.Status
+}
+
 type StorageFailure struct {
 	Status        string
 	SchemaVersion int
@@ -57,17 +62,23 @@ type Handler struct {
 	build          version.Info
 	store          Store
 	storageFailure StorageFailure
+	mediaStatus    MediaStatusProvider
 	writes         chan struct{}
 	mux            *http.ServeMux
 }
 
-func New(cfg config.Config, logger *logging.Logger, build version.Info, store Store, failure StorageFailure) *Handler {
+func New(cfg config.Config, logger *logging.Logger, build version.Info, store Store, failure StorageFailure, mediaProviders ...MediaStatusProvider) *Handler {
+	var mediaStatus MediaStatusProvider = mediaingest.NewFixedStatusProvider(mediaingest.ModuleDisabled, "")
+	if len(mediaProviders) > 0 && mediaProviders[0] != nil {
+		mediaStatus = mediaProviders[0]
+	}
 	handler := &Handler{
 		config:         cfg,
 		logger:         logger,
 		build:          build,
 		store:          store,
 		storageFailure: failure,
+		mediaStatus:    mediaStatus,
 		writes:         make(chan struct{}, cfg.API.MaxConcurrentWrites),
 		mux:            http.NewServeMux(),
 	}
@@ -75,7 +86,15 @@ func New(cfg config.Config, logger *logging.Logger, build version.Info, store St
 	handler.mux.HandleFunc("/health/ready", handler.handleReadiness)
 	handler.mux.HandleFunc("/api/v1/events/batch", handler.handleEventBatch)
 	handler.mux.HandleFunc("/api/v1/events", handler.handleEventQuery)
+	handler.mux.HandleFunc("/api/v1/media/ingest/status", handler.handleMediaIngestStatus)
 	return handler
+}
+
+func (handler *Handler) handleMediaIngestStatus(writer http.ResponseWriter, request *http.Request) {
+	if !allowReadMethod(writer, request) {
+		return
+	}
+	writeJSON(writer, request, http.StatusOK, handler.mediaStatus.Status(request.Context()))
 }
 
 func (handler *Handler) ServeHTTP(writer http.ResponseWriter, request *http.Request) {

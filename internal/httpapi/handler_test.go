@@ -15,6 +15,7 @@ import (
 	"github.com/Versifine/study-monitor/internal/config"
 	"github.com/Versifine/study-monitor/internal/eventstore"
 	"github.com/Versifine/study-monitor/internal/logging"
+	"github.com/Versifine/study-monitor/internal/mediaingest"
 	"github.com/Versifine/study-monitor/internal/version"
 )
 
@@ -258,6 +259,41 @@ func TestReadinessReportsWritableAndInitializationFailure(t *testing.T) {
 	}
 }
 
+func TestMediaStatusIsReadOnlyAndDoesNotChangeCoreReadiness(t *testing.T) {
+	handler, store, cfg := newIntegratedHandler(t)
+	defer store.Close()
+	provider := &mediaStatusStub{status: mediaingest.Status{
+		SchemaVersion:  1,
+		Status:         mediaingest.ModuleUnavailable,
+		ErrorCode:      mediaingest.CodeProbeUnavailable,
+		FFprobeVersion: mediaingest.SupportedFFprobeVersion,
+		Ingest:         eventstore.MediaIngestSummary{Pending: 2, Backlog: 2},
+	}}
+	handler = New(cfg, testLogger(t), version.Info{Version: "test"}, store, StorageFailure{}, provider)
+
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/api/v1/media/ingest/status", nil))
+	if response.Code != http.StatusOK {
+		t.Fatalf("media status=%d body=%s", response.Code, response.Body.String())
+	}
+	var status mediaingest.Status
+	decodeResponse(t, response, &status)
+	if status.Status != mediaingest.ModuleUnavailable || status.ErrorCode != mediaingest.CodeProbeUnavailable || status.Ingest.Pending != 2 {
+		t.Fatalf("media response = %#v", status)
+	}
+
+	ready := httptest.NewRecorder()
+	handler.ServeHTTP(ready, httptest.NewRequest(http.MethodGet, "/health/ready", nil))
+	if ready.Code != http.StatusOK {
+		t.Fatalf("media failure changed core readiness: %d %s", ready.Code, ready.Body.String())
+	}
+	post := httptest.NewRecorder()
+	handler.ServeHTTP(post, httptest.NewRequest(http.MethodPost, "/api/v1/media/ingest/status", nil))
+	if post.Code != http.StatusMethodNotAllowed || post.Header().Get("Allow") != "GET, HEAD" {
+		t.Fatalf("media POST status=%d allow=%q", post.Code, post.Header().Get("Allow"))
+	}
+}
+
 func TestWriteConcurrencyLimitFailsFast(t *testing.T) {
 	cfg := testConfig(t)
 	cfg.API.MaxConcurrentWrites = 1
@@ -305,6 +341,12 @@ type blockingStore struct {
 	entered chan struct{}
 	release chan struct{}
 }
+
+type mediaStatusStub struct {
+	status mediaingest.Status
+}
+
+func (stub *mediaStatusStub) Status(context.Context) mediaingest.Status { return stub.status }
 
 func (store *blockingStore) AppendBatch(_ context.Context, _ []eventstore.Candidate) ([]eventstore.WriteResult, error) {
 	close(store.entered)

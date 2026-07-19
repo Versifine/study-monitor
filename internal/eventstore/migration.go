@@ -13,7 +13,7 @@ import (
 	repositorymigrations "github.com/Versifine/study-monitor/migrations"
 )
 
-const CurrentSchemaVersion = 1
+const CurrentSchemaVersion = 2
 
 type migration struct {
 	version  int
@@ -23,17 +23,22 @@ type migration struct {
 }
 
 func repositoryMigrations() ([]migration, error) {
-	raw, err := repositorymigrations.Files.ReadFile("001_raw_events.sql")
-	if err != nil {
-		return nil, err
+	files := []string{"001_raw_events.sql", "002_media_ingest.sql"}
+	migrations := make([]migration, 0, len(files))
+	for index, name := range files {
+		raw, err := repositorymigrations.Files.ReadFile(name)
+		if err != nil {
+			return nil, err
+		}
+		digest := sha256.Sum256(raw)
+		migrations = append(migrations, migration{
+			version:  index + 1,
+			name:     name,
+			contents: string(raw),
+			checksum: hex.EncodeToString(digest[:]),
+		})
 	}
-	digest := sha256.Sum256(raw)
-	return []migration{{
-		version:  1,
-		name:     "001_raw_events.sql",
-		contents: string(raw),
-		checksum: hex.EncodeToString(digest[:]),
-	}}, nil
+	return migrations, nil
 }
 
 func migrate(ctx context.Context, db *sql.DB, now func() time.Time) error {
@@ -45,6 +50,10 @@ func migrate(ctx context.Context, db *sql.DB, now func() time.Time) error {
 }
 
 func applyMigrations(ctx context.Context, db *sql.DB, migrations []migration, now func() time.Time) error {
+	return applyMigrationsThrough(ctx, db, migrations, now, CurrentSchemaVersion)
+}
+
+func applyMigrationsThrough(ctx context.Context, db *sql.DB, migrations []migration, now func() time.Time, targetVersion int) error {
 	sort.Slice(migrations, func(i, j int) bool { return migrations[i].version < migrations[j].version })
 	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {
@@ -76,8 +85,8 @@ END;`); err != nil {
 	if err := tx.QueryRowContext(ctx, "PRAGMA user_version").Scan(&userVersion); err != nil {
 		return classifySQLiteError(CodeMigrationFailed, "read schema version", err)
 	}
-	if userVersion > CurrentSchemaVersion {
-		return &Error{Code: CodeMigrationUnsupported, Err: fmt.Errorf("database schema version %d is newer than supported version %d", userVersion, CurrentSchemaVersion)}
+	if userVersion > targetVersion {
+		return &Error{Code: CodeMigrationUnsupported, Err: fmt.Errorf("database schema version %d is newer than supported version %d", userVersion, targetVersion)}
 	}
 
 	recorded := make(map[int]string)
@@ -108,7 +117,7 @@ END;`); err != nil {
 	}
 	for version, checksum := range recorded {
 		item, ok := known[version]
-		if !ok || version > CurrentSchemaVersion {
+		if !ok || version > targetVersion {
 			return &Error{Code: CodeMigrationUnsupported, Err: fmt.Errorf("database contains unknown migration version %d", version)}
 		}
 		if checksum != item.checksum {
@@ -120,6 +129,9 @@ END;`); err != nil {
 	}
 
 	for _, item := range migrations {
+		if item.version > targetVersion {
+			break
+		}
 		if item.version <= userVersion {
 			continue
 		}
@@ -145,7 +157,7 @@ END;`); err != nil {
 		userVersion = item.version
 	}
 
-	if userVersion != CurrentSchemaVersion {
+	if userVersion != targetVersion {
 		return &Error{Code: CodeMigrationFailed, Err: errors.New("not all required migrations were applied")}
 	}
 	if err := tx.Commit(); err != nil {

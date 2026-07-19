@@ -12,6 +12,7 @@ import (
 	"github.com/Versifine/study-monitor/internal/eventstore"
 	"github.com/Versifine/study-monitor/internal/httpapi"
 	"github.com/Versifine/study-monitor/internal/logging"
+	"github.com/Versifine/study-monitor/internal/mediaingest"
 	"github.com/Versifine/study-monitor/internal/version"
 )
 
@@ -46,12 +47,12 @@ type Server struct {
 	handler http.Handler
 }
 
-func NewServer(cfg config.Config, logger *logging.Logger, build version.Info, store httpapi.Store, failure httpapi.StorageFailure) *Server {
+func NewServer(cfg config.Config, logger *logging.Logger, build version.Info, store httpapi.Store, failure httpapi.StorageFailure, mediaProviders ...httpapi.MediaStatusProvider) *Server {
 	return &Server{
 		config:  cfg,
 		logger:  logger,
 		version: build,
-		handler: httpapi.New(cfg, logger, build, store, failure),
+		handler: httpapi.New(cfg, logger, build, store, failure, mediaProviders...),
 	}
 }
 
@@ -71,13 +72,40 @@ func Run(ctx context.Context, cfg config.Config, logger *logging.Logger, build v
 		MaxPayloadDepth: cfg.API.MaxPayloadDepth, MaxPageSize: cfg.API.MaxPageSize,
 	})
 	failure := httpapi.StorageFailure{}
+	var mediaStatus httpapi.MediaStatusProvider = mediaingest.NewFixedStatusProvider(mediaingest.ModuleDisabled, "")
+	var mediaManager *mediaingest.Manager
 	if storeErr != nil {
 		failure = classifyStorageFailure(storeErr)
 		logger.Error("storage", "initialization_failed", failure.ErrorCode, "event storage initialization failed", storeErr)
 	} else {
 		defer store.Close()
+		if cfg.MediaIngest.Enabled {
+			mediaManager = mediaingest.New(cfg, store, logger)
+			mediaStatus = mediaManager
+		}
 	}
-	return NewServer(cfg, logger, build, store, failure).Serve(ctx, listener)
+	if cfg.MediaIngest.Enabled && storeErr != nil {
+		mediaStatus = mediaingest.NewFixedStatusProvider(mediaingest.ModuleUnavailable, eventstore.ErrorCode(storeErr))
+	}
+	runContext, cancel := context.WithCancel(ctx)
+	defer cancel()
+	mediaDone := make(chan struct{})
+	if mediaManager != nil {
+		go func() {
+			defer close(mediaDone)
+			if err := mediaManager.Initialize(runContext); err != nil {
+				logger.Error("media_ingest", "initialization_failed", mediaingest.ErrorCode(err), "media ingest disabled after initialization failure", err)
+				return
+			}
+			mediaManager.Run(runContext)
+		}()
+	} else {
+		close(mediaDone)
+	}
+	err = NewServer(cfg, logger, build, store, failure, mediaStatus).Serve(runContext, listener)
+	cancel()
+	<-mediaDone
+	return err
 }
 
 func classifyStorageFailure(err error) httpapi.StorageFailure {
