@@ -220,22 +220,31 @@ func TestManagerDistinguishesSourceAndMetadataConflicts(t *testing.T) {
 
 func TestManagerQuarantinesTruncatedAndInvalidProbeMedia(t *testing.T) {
 	tests := []struct {
-		name   string
-		prober Prober
-		mutate func(*Sidecar)
+		name       string
+		prober     Prober
+		mutate     func(*Sidecar)
+		reasonCode string
 	}{
 		{
-			name:   "declared size mismatch",
-			prober: fakeProber{},
-			mutate: func(sidecar *Sidecar) { sidecar.SizeBytes++ },
+			name:       "declared size mismatch",
+			prober:     fakeProber{},
+			mutate:     func(sidecar *Sidecar) { sidecar.SizeBytes++ },
+			reasonCode: CodeSizeMismatch,
 		},
 		{
-			name:   "duration one millisecond over limit",
-			prober: fakeProber{info: ProbeInfo{DurationMS: int64(10*time.Minute/time.Millisecond) + 1, CodecName: "h264", FormatName: "mov,mp4", MediaType: "video"}},
+			name:       "duration one millisecond over limit",
+			prober:     fakeProber{info: ProbeInfo{DurationMS: int64(10*time.Minute/time.Millisecond) + 1, CodecName: "h264", FormatName: "mov,mp4", MediaType: "video"}},
+			reasonCode: CodeDurationInvalid,
 		},
 		{
-			name:   "wrong media type",
-			prober: fakeProber{info: ProbeInfo{DurationMS: 1000, CodecName: "aac", FormatName: "wav", MediaType: "audio"}},
+			name:       "duration exceeds nanosecond conversion range",
+			prober:     fakeProber{info: ProbeInfo{DurationMS: int64(^uint64(0)>>1)/int64(time.Millisecond) + 1, CodecName: "h264", FormatName: "mov,mp4", MediaType: "video"}},
+			reasonCode: CodeDurationInvalid,
+		},
+		{
+			name:       "wrong media type",
+			prober:     fakeProber{info: ProbeInfo{DurationMS: 1000, CodecName: "aac", FormatName: "wav", MediaType: "audio"}},
+			reasonCode: CodeTypeInvalid,
 		},
 	}
 	for _, test := range tests {
@@ -251,6 +260,7 @@ func TestManagerQuarantinesTruncatedAndInvalidProbeMedia(t *testing.T) {
 			if err != nil || summary.Quarantined != 1 || summary.TotalSegments != 0 {
 				t.Fatalf("summary = %#v, %v", summary, err)
 			}
+			assertQuarantineReason(t, manager.quarantineRoot, test.reasonCode)
 		})
 	}
 }

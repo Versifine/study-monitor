@@ -338,7 +338,7 @@ func (manager *Manager) ProcessReady(ctx context.Context, readyPath string) (boo
 	if probe.MediaType != sidecar.MediaType {
 		return false, manager.quarantine(ctx, identity, mediaPath, sidecarRaw, stagingPath, CodeTypeInvalid)
 	}
-	if time.Duration(probe.DurationMS)*time.Millisecond > manager.config.MediaMaxSegmentDuration() {
+	if probe.DurationMS > manager.config.MediaMaxSegmentDuration().Milliseconds() {
 		return false, manager.quarantine(ctx, identity, mediaPath, sidecarRaw, stagingPath, CodeDurationInvalid)
 	}
 	metadataDigest, err := metadataHash(sidecar, probe)
