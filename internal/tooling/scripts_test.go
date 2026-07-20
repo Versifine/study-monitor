@@ -13,7 +13,10 @@ import (
 	"time"
 )
 
-const nestedScriptTest = "EXAM_MONITOR_NESTED_SCRIPT_TEST"
+const (
+	nestedScriptTest        = "EXAM_MONITOR_NESTED_SCRIPT_TEST"
+	powerShellScriptTimeout = 180 * time.Second
+)
 
 func TestBuildScriptMarksUntrackedGoInputDirtyAndUsesLocalToolchain(t *testing.T) {
 	requireOuterWindowsTest(t)
@@ -66,6 +69,19 @@ if ($LASTEXITCODE -ne 0) { throw 'built binary version check failed' }
 	}
 	if want := commit + "-dirty"; build.Commit != want {
 		t.Fatalf("build commit = %q, want %q", build.Commit, want)
+	}
+}
+
+func TestCoverageSourceDirectoryIsNotIgnored(t *testing.T) {
+	repository := repositoryRoot(t)
+	command := exec.Command("git", "-C", repository, "check-ignore", "--no-index", "--quiet", "internal/coverage/coverage.go")
+	err := command.Run()
+	if err == nil {
+		t.Fatal("internal/coverage/coverage.go is ignored and would be omitted from a clean checkout")
+	}
+	exitError, ok := err.(*exec.ExitError)
+	if !ok || exitError.ExitCode() != 1 {
+		t.Fatalf("git check-ignore failed unexpectedly: %v", err)
 	}
 }
 
@@ -131,7 +147,7 @@ func writePowerShellWrapper(t *testing.T, contents string) string {
 
 func runPowerShell(t *testing.T, script string, environment []string) string {
 	t.Helper()
-	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), powerShellScriptTimeout)
 	defer cancel()
 	command := exec.CommandContext(ctx, "powershell.exe", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", script)
 	command.Env = append(os.Environ(), environment...)

@@ -16,6 +16,7 @@ import (
 const (
 	CurrentSchemaVersion      = 1
 	currentMediaSchemaVersion = 2
+	currentM3SchemaVersion    = 1
 )
 
 type migration struct {
@@ -31,6 +32,10 @@ func repositoryMigrations() ([]migration, error) {
 
 func repositoryMediaMigrations() ([]migration, error) {
 	return loadMigrations([]string{"002_media_ingest.sql", "003_media_file_checks.sql"})
+}
+
+func repositoryM3Migrations() ([]migration, error) {
+	return loadMigrations([]string{"004_collectors_timeline.sql"})
 }
 
 func loadMigrations(files []string) ([]migration, error) {
@@ -63,7 +68,14 @@ func migrate(ctx context.Context, db *sql.DB, now func() time.Time) error {
 	if err != nil {
 		return wrap(CodeMigrationFailed, "load embedded media migrations", err)
 	}
-	return applyMediaMigrations(ctx, db, mediaMigrations, now)
+	if err := applyMediaMigrations(ctx, db, mediaMigrations, now); err != nil {
+		return err
+	}
+	m3Migrations, err := repositoryM3Migrations()
+	if err != nil {
+		return wrap(CodeMigrationFailed, "load embedded M3 migrations", err)
+	}
+	return applyM3Migrations(ctx, db, m3Migrations, now)
 }
 
 func applyMigrations(ctx context.Context, db *sql.DB, migrations []migration, now func() time.Time) error {
@@ -184,53 +196,62 @@ END;`); err != nil {
 }
 
 func applyMediaMigrations(ctx context.Context, db *sql.DB, migrations []migration, now func() time.Time) error {
+	return applyIndependentMigrations(ctx, db, migrations, now, "media_schema_migrations", "MEDIA_SCHEMA_MIGRATIONS", "media", currentMediaSchemaVersion)
+}
+
+func applyM3Migrations(ctx context.Context, db *sql.DB, migrations []migration, now func() time.Time) error {
+	return applyIndependentMigrations(ctx, db, migrations, now, "m3_schema_migrations", "M3_SCHEMA_MIGRATIONS", "M3", currentM3SchemaVersion)
+}
+
+func applyIndependentMigrations(ctx context.Context, db *sql.DB, migrations []migration, now func() time.Time, ledger, triggerPrefix, label string, targetVersion int) error {
 	sort.Slice(migrations, func(i, j int) bool { return migrations[i].version < migrations[j].version })
 	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {
-		return classifySQLiteError(CodeMigrationFailed, "begin media migration transaction", err)
+		return classifySQLiteError(CodeMigrationFailed, "begin "+label+" migration transaction", err)
 	}
 	defer tx.Rollback()
 
-	if _, err := tx.ExecContext(ctx, `
-CREATE TABLE IF NOT EXISTS media_schema_migrations (
+	ledgerSQL := fmt.Sprintf(`
+CREATE TABLE IF NOT EXISTS %s (
     version INTEGER PRIMARY KEY,
     name TEXT NOT NULL,
     checksum TEXT NOT NULL CHECK (length(checksum) = 64),
     applied_at_utc TEXT NOT NULL
 ) STRICT;
-CREATE TRIGGER IF NOT EXISTS media_schema_migrations_reject_update
-BEFORE UPDATE ON media_schema_migrations
+CREATE TRIGGER IF NOT EXISTS %s_reject_update
+BEFORE UPDATE ON %s
 BEGIN
-    SELECT RAISE(ABORT, 'MEDIA_SCHEMA_MIGRATIONS_APPEND_ONLY');
+    SELECT RAISE(ABORT, '%s_APPEND_ONLY');
 END;
-CREATE TRIGGER IF NOT EXISTS media_schema_migrations_reject_delete
-BEFORE DELETE ON media_schema_migrations
+CREATE TRIGGER IF NOT EXISTS %s_reject_delete
+BEFORE DELETE ON %s
 BEGIN
-    SELECT RAISE(ABORT, 'MEDIA_SCHEMA_MIGRATIONS_APPEND_ONLY');
-END;`); err != nil {
-		return classifySQLiteError(CodeMigrationFailed, "create media migration ledger", err)
+    SELECT RAISE(ABORT, '%s_APPEND_ONLY');
+END;`, ledger, ledger, ledger, triggerPrefix, ledger, ledger, triggerPrefix)
+	if _, err := tx.ExecContext(ctx, ledgerSQL); err != nil {
+		return classifySQLiteError(CodeMigrationFailed, "create "+label+" migration ledger", err)
 	}
 
 	recorded := make(map[int]string)
-	rows, err := tx.QueryContext(ctx, "SELECT version, checksum FROM media_schema_migrations ORDER BY version")
+	rows, err := tx.QueryContext(ctx, "SELECT version, checksum FROM "+ledger+" ORDER BY version")
 	if err != nil {
-		return classifySQLiteError(CodeMigrationFailed, "read media migration ledger", err)
+		return classifySQLiteError(CodeMigrationFailed, "read "+label+" migration ledger", err)
 	}
 	for rows.Next() {
 		var version int
 		var checksum string
 		if err := rows.Scan(&version, &checksum); err != nil {
 			rows.Close()
-			return wrap(CodeMigrationFailed, "scan media migration ledger", err)
+			return wrap(CodeMigrationFailed, "scan "+label+" migration ledger", err)
 		}
 		recorded[version] = checksum
 	}
 	if err := rows.Err(); err != nil {
 		rows.Close()
-		return classifySQLiteError(CodeMigrationFailed, "iterate media migration ledger", err)
+		return classifySQLiteError(CodeMigrationFailed, "iterate "+label+" migration ledger", err)
 	}
 	if err := rows.Close(); err != nil {
-		return wrap(CodeMigrationFailed, "close media migration ledger", err)
+		return wrap(CodeMigrationFailed, "close "+label+" migration ledger", err)
 	}
 
 	known := make(map[int]migration, len(migrations))
@@ -239,41 +260,41 @@ END;`); err != nil {
 	}
 	for version, checksum := range recorded {
 		item, ok := known[version]
-		if !ok || version > currentMediaSchemaVersion {
-			return &Error{Code: CodeMigrationUnsupported, Err: fmt.Errorf("database contains unknown media migration version %d", version)}
+		if !ok || version > targetVersion {
+			return &Error{Code: CodeMigrationUnsupported, Err: fmt.Errorf("database contains unknown %s migration version %d", label, version)}
 		}
 		if checksum != item.checksum {
-			return &Error{Code: CodeMigrationFailed, Err: fmt.Errorf("media migration checksum mismatch for version %d", version)}
+			return &Error{Code: CodeMigrationFailed, Err: fmt.Errorf("%s migration checksum mismatch for version %d", label, version)}
 		}
 	}
 
 	appliedVersion := 0
-	for version := 1; version <= currentMediaSchemaVersion; version++ {
+	for version := 1; version <= targetVersion; version++ {
 		if _, ok := recorded[version]; !ok {
 			break
 		}
 		appliedVersion = version
 	}
 	if len(recorded) != appliedVersion {
-		return &Error{Code: CodeMigrationFailed, Err: errors.New("media migration ledger is not contiguous")}
+		return &Error{Code: CodeMigrationFailed, Err: fmt.Errorf("%s migration ledger is not contiguous", label)}
 	}
 
 	for _, item := range migrations {
-		if item.version > currentMediaSchemaVersion {
+		if item.version > targetVersion {
 			break
 		}
 		if item.version <= appliedVersion {
 			continue
 		}
 		if item.version != appliedVersion+1 {
-			return &Error{Code: CodeMigrationFailed, Err: fmt.Errorf("media migration sequence jumps from %d to %d", appliedVersion, item.version)}
+			return &Error{Code: CodeMigrationFailed, Err: fmt.Errorf("%s migration sequence jumps from %d to %d", label, appliedVersion, item.version)}
 		}
 		if _, err := tx.ExecContext(ctx, item.contents); err != nil {
 			return classifySQLiteError(CodeMigrationFailed, "apply "+item.name, err)
 		}
 		if _, err := tx.ExecContext(
 			ctx,
-			"INSERT INTO media_schema_migrations(version, name, checksum, applied_at_utc) VALUES(?, ?, ?, ?)",
+			"INSERT INTO "+ledger+"(version, name, checksum, applied_at_utc) VALUES(?, ?, ?, ?)",
 			item.version,
 			item.name,
 			item.checksum,
@@ -284,11 +305,11 @@ END;`); err != nil {
 		appliedVersion = item.version
 	}
 
-	if appliedVersion != currentMediaSchemaVersion {
-		return &Error{Code: CodeMigrationFailed, Err: errors.New("not all required media migrations were applied")}
+	if appliedVersion != targetVersion {
+		return &Error{Code: CodeMigrationFailed, Err: fmt.Errorf("not all required %s migrations were applied", label)}
 	}
 	if err := tx.Commit(); err != nil {
-		return classifySQLiteError(CodeMigrationFailed, "commit media migrations", err)
+		return classifySQLiteError(CodeMigrationFailed, "commit "+label+" migrations", err)
 	}
 	return nil
 }

@@ -27,7 +27,7 @@ func TestOpenMigratesNewDatabaseAndReopensIdempotently(t *testing.T) {
 		t.Fatalf("schema version = %d, want %d", schemaVersion, CurrentSchemaVersion)
 	}
 	var journalMode string
-	var foreignKeys, busyTimeout, migrationCount, mediaMigrationCount int
+	var foreignKeys, busyTimeout, migrationCount, mediaMigrationCount, m3MigrationCount int
 	if err := store.db.QueryRow("PRAGMA journal_mode").Scan(&journalMode); err != nil {
 		t.Fatal(err)
 	}
@@ -43,8 +43,11 @@ func TestOpenMigratesNewDatabaseAndReopensIdempotently(t *testing.T) {
 	if err := store.db.QueryRow("SELECT COUNT(*) FROM media_schema_migrations").Scan(&mediaMigrationCount); err != nil {
 		t.Fatal(err)
 	}
-	if journalMode != "wal" || foreignKeys != 1 || busyTimeout != 5000 || migrationCount != 1 || mediaMigrationCount != 2 {
-		t.Fatalf("pragmas/migrations = journal:%s foreign:%d busy:%d core:%d media:%d", journalMode, foreignKeys, busyTimeout, migrationCount, mediaMigrationCount)
+	if err := store.db.QueryRow("SELECT COUNT(*) FROM m3_schema_migrations").Scan(&m3MigrationCount); err != nil {
+		t.Fatal(err)
+	}
+	if journalMode != "wal" || foreignKeys != 1 || busyTimeout != 5000 || migrationCount != 1 || mediaMigrationCount != 2 || m3MigrationCount != 1 {
+		t.Fatalf("pragmas/migrations = journal:%s foreign:%d busy:%d core:%d media:%d m3:%d", journalMode, foreignKeys, busyTimeout, migrationCount, mediaMigrationCount, m3MigrationCount)
 	}
 	if err := store.Close(); err != nil {
 		t.Fatal(err)
@@ -63,6 +66,12 @@ func TestOpenMigratesNewDatabaseAndReopensIdempotently(t *testing.T) {
 	}
 	if mediaMigrationCount != 2 {
 		t.Fatalf("media migration count after reopen = %d", mediaMigrationCount)
+	}
+	if err := reopened.db.QueryRow("SELECT COUNT(*) FROM m3_schema_migrations").Scan(&m3MigrationCount); err != nil {
+		t.Fatal(err)
+	}
+	if m3MigrationCount != 1 {
+		t.Fatalf("M3 migration count after reopen = %d", m3MigrationCount)
 	}
 }
 
@@ -83,6 +92,15 @@ func TestEmbeddedMigrationBytesHaveStableLineEndings(t *testing.T) {
 	for _, item := range mediaMigrations {
 		if strings.Contains(item.contents, "\r\n") {
 			t.Fatalf("media migration %s contains CRLF; checksum must not depend on Windows checkout conversion", item.name)
+		}
+	}
+	m3Migrations, err := repositoryM3Migrations()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, item := range m3Migrations {
+		if strings.Contains(item.contents, "\r\n") {
+			t.Fatalf("M3 migration %s contains CRLF; checksum must not depend on Windows checkout conversion", item.name)
 		}
 	}
 }
@@ -124,6 +142,22 @@ func TestOpenRejectsUnsupportedAndModifiedMigrations(t *testing.T) {
 			t.Fatal(err)
 		}
 		if _, err := store.db.Exec("UPDATE media_schema_migrations SET checksum = ? WHERE version = 1", fmt.Sprintf("%064d", 0)); err != nil {
+			t.Fatal(err)
+		}
+		store.Close()
+		_, err := Open(context.Background(), path, testOptions())
+		if ErrorCode(err) != CodeMigrationFailed {
+			t.Fatalf("Open() error code = %q, want %q (err=%v)", ErrorCode(err), CodeMigrationFailed, err)
+		}
+	})
+
+	t.Run("M3 checksum mismatch", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "modified-m3.db")
+		store := openTestStore(t, path)
+		if _, err := store.db.Exec("DROP TRIGGER m3_schema_migrations_reject_update"); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := store.db.Exec("UPDATE m3_schema_migrations SET checksum = ? WHERE version = 1", fmt.Sprintf("%064d", 0)); err != nil {
 			t.Fatal(err)
 		}
 		store.Close()

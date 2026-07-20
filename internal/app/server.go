@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/http"
 
+	"github.com/Versifine/study-monitor/internal/collectors"
 	"github.com/Versifine/study-monitor/internal/config"
 	"github.com/Versifine/study-monitor/internal/eventstore"
 	"github.com/Versifine/study-monitor/internal/httpapi"
@@ -20,8 +21,6 @@ const (
 	CodeListenFailed   = "APP_LISTEN_FAILED"
 	CodeServeFailed    = "APP_SERVE_FAILED"
 	CodeShutdownFailed = "APP_SHUTDOWN_FAILED"
-
-	runtimeMode = "record-only"
 )
 
 type Error struct {
@@ -47,12 +46,12 @@ type Server struct {
 	handler http.Handler
 }
 
-func NewServer(cfg config.Config, logger *logging.Logger, build version.Info, store httpapi.Store, failure httpapi.StorageFailure, mediaProviders ...httpapi.MediaStatusProvider) *Server {
+func NewServer(cfg config.Config, logger *logging.Logger, build version.Info, store httpapi.Store, failure httpapi.StorageFailure, providers ...any) *Server {
 	return &Server{
 		config:  cfg,
 		logger:  logger,
 		version: build,
-		handler: httpapi.New(cfg, logger, build, store, failure, mediaProviders...),
+		handler: httpapi.New(cfg, logger, build, store, failure, providers...),
 	}
 }
 
@@ -66,14 +65,22 @@ func Run(ctx context.Context, cfg config.Config, logger *logging.Logger, build v
 	}
 	defer listener.Close()
 
+	collectorPolicies := make(map[string]eventstore.CollectorPolicy)
+	for _, collector := range cfg.Collectors {
+		if collector.Enabled {
+			collectorPolicies[collector.ID] = eventstore.CollectorPolicy{Kind: collector.Kind, HeartbeatPeriod: collector.HeartbeatPeriodDuration()}
+		}
+	}
 	store, storeErr := eventstore.Open(ctx, cfg.DatabasePath(), eventstore.Options{
 		BusyTimeout: cfg.BusyTimeout(), MaxOpenConnections: cfg.Storage.MaxOpenConnections,
 		MaxBatchEvents: cfg.API.MaxBatchEvents, MaxEventBytes: cfg.API.MaxEventBytes,
 		MaxPayloadDepth: cfg.API.MaxPayloadDepth, MaxPageSize: cfg.API.MaxPageSize,
+		CollectorPolicies: collectorPolicies,
 	})
 	failure := httpapi.StorageFailure{}
 	var mediaStatus httpapi.MediaStatusProvider = mediaingest.NewFixedStatusProvider(mediaingest.ModuleDisabled, "")
 	var mediaManager *mediaingest.Manager
+	var collectorManager *collectors.Manager
 	if storeErr != nil {
 		failure = classifyStorageFailure(storeErr)
 		logger.Error("storage", "initialization_failed", failure.ErrorCode, "event storage initialization failed", storeErr)
@@ -83,6 +90,7 @@ func Run(ctx context.Context, cfg config.Config, logger *logging.Logger, build v
 			mediaManager = mediaingest.New(cfg, store, logger)
 			mediaStatus = mediaManager
 		}
+		collectorManager = collectors.New(cfg, store, logger)
 	}
 	if cfg.MediaIngest.Enabled && storeErr != nil {
 		mediaStatus = mediaingest.NewFixedStatusProvider(mediaingest.ModuleUnavailable, eventstore.ErrorCode(storeErr))
@@ -90,6 +98,7 @@ func Run(ctx context.Context, cfg config.Config, logger *logging.Logger, build v
 	runContext, cancel := context.WithCancel(ctx)
 	defer cancel()
 	mediaDone := make(chan struct{})
+	collectorDone := make(chan struct{})
 	if mediaManager != nil {
 		go func() {
 			defer close(mediaDone)
@@ -102,9 +111,22 @@ func Run(ctx context.Context, cfg config.Config, logger *logging.Logger, build v
 	} else {
 		close(mediaDone)
 	}
-	err = NewServer(cfg, logger, build, store, failure, mediaStatus).Serve(runContext, listener)
+	if collectorManager != nil {
+		go func() {
+			defer close(collectorDone)
+			collectorManager.Run(runContext)
+		}()
+	} else {
+		close(collectorDone)
+	}
+	providers := []any{mediaStatus}
+	if collectorManager != nil {
+		providers = append(providers, collectorManager)
+	}
+	err = NewServer(cfg, logger, build, store, failure, providers...).Serve(runContext, listener)
 	cancel()
 	<-mediaDone
+	<-collectorDone
 	return err
 }
 
@@ -131,7 +153,7 @@ func (server *Server) Serve(ctx context.Context, listener net.Listener) error {
 		"started",
 		"recorder core started",
 		slog.String("listen_address", listener.Addr().String()),
-		slog.String("mode", runtimeMode),
+		slog.String("mode", server.config.Runtime.Mode),
 	)
 
 	serveResult := make(chan error, 1)

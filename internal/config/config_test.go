@@ -1,8 +1,10 @@
 package config
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -244,6 +246,112 @@ func TestLoadRejectsRelativeDataDirectoryWithoutAbsoluteApplicationRoot(t *testi
 	}
 	if got := ErrorCode(err); got != CodeInvalidDataDir {
 		t.Fatalf("ErrorCode() = %q", got)
+	}
+}
+
+func TestM3CollectorConfigurationAndModes(t *testing.T) {
+	validCollectors := `[
+      {"id":"aw.afk","kind":"activitywatch","enabled":true,"heartbeat_period":"1m","allowed_lateness":"1m","offline_after":"5m","planned_schedule":{"timezone":"Asia/Shanghai","windows":[{"days":["monday","tuesday","wednesday","thursday","friday","saturday","sunday"],"start_local":"00:00","end_local":"24:00"}]},"activitywatch":{"base_url":"http://127.0.0.1:5600","bucket_id":"aw-watcher-afk_host","poll_interval":"30s","request_timeout":"2s","initial_lookback":"24h","rescan_window":"1h","page_size":100,"max_pages_per_poll":10,"max_response_bytes":1048576,"clock_error_ms":100}},
+      {"id":"desk.media","kind":"media","enabled":true,"heartbeat_period":"5m","allowed_lateness":"5m","offline_after":"15m","planned_schedule":{"timezone":"Asia/Shanghai","windows":[{"days":["monday","tuesday","wednesday","thursday","friday","saturday","sunday"],"start_local":"00:00","end_local":"24:00"}]}}
+    ]`
+
+	t.Run("record-only accepts frozen collectors", func(t *testing.T) {
+		path := writeConfig(t, `{"schema_version":1,"collectors":`+validCollectors+`}`)
+		cfg, err := Load(path, emptyEnvironment)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if cfg.Runtime.Mode != ModeRecordOnly || len(cfg.Collectors) != 2 || cfg.Collectors[0].ActivityWatch == nil {
+			t.Fatalf("unexpected M3 config: %#v", cfg)
+		}
+	})
+
+	t.Run("minimum enables only required recorder modules", func(t *testing.T) {
+		root := filepath.Join(t.TempDir(), "minimum")
+		ffprobe := filepath.Join(root, "ffprobe.exe")
+		json := `{"schema_version":1,"runtime":{"mode":"minimum","backup_interface_enabled":true},"paths":{"data_directory":` + strconv.Quote(root) + `},"media_ingest":{"enabled":true,"ffprobe_path":` + strconv.Quote(ffprobe) + `},"collectors":` + validCollectors + `}`
+		cfg, err := Load(writeConfig(t, json), emptyEnvironment)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if cfg.Runtime.Mode != ModeMinimum || !cfg.Runtime.BackupInterfaceEnabled || !cfg.MediaIngest.Enabled {
+			t.Fatalf("unexpected minimum config: %#v", cfg)
+		}
+	})
+
+	tests := []struct {
+		name string
+		json string
+		code string
+	}{
+		{name: "ActivityWatch SLA", json: strings.Replace(validCollectors, `"offline_after":"5m"`, `"offline_after":"6m"`, 1), code: CodeInvalidCollector},
+		{name: "heartbeat relationship", json: strings.Replace(validCollectors, `"allowed_lateness":"1m"`, `"allowed_lateness":"5m"`, 1), code: CodeInvalidCollector},
+		{name: "non-loopback ActivityWatch", json: strings.Replace(validCollectors, `http://127.0.0.1:5600`, `http://192.0.2.1:5600`, 1), code: CodeInvalidCollector},
+		{name: "zero ActivityWatch port", json: strings.Replace(validCollectors, `http://127.0.0.1:5600`, `http://127.0.0.1:0`, 1), code: CodeInvalidCollector},
+		{name: "out of range ActivityWatch port", json: strings.Replace(validCollectors, `http://127.0.0.1:5600`, `http://127.0.0.1:99999`, 1), code: CodeInvalidCollector},
+		{name: "non-numeric ActivityWatch port", json: strings.Replace(validCollectors, `http://127.0.0.1:5600`, `http://127.0.0.1:abc`, 1), code: CodeInvalidCollector},
+		{name: "poll slower than heartbeat", json: strings.Replace(validCollectors, `"poll_interval":"30s"`, `"poll_interval":"2m"`, 1), code: CodeInvalidCollector},
+		{name: "ActivityWatch response page too large", json: strings.Replace(validCollectors, `"max_response_bytes":1048576`, `"max_response_bytes":8388609`, 1), code: CodeInvalidCollector},
+		{name: "unknown timezone", json: strings.Replace(validCollectors, `Asia/Shanghai`, `Missing/Zone`, 1), code: CodeInvalidCollector},
+		{name: "machine-local timezone", json: strings.Replace(validCollectors, `Asia/Shanghai`, `Local`, 1), code: CodeInvalidCollector},
+		{name: "collector id control character", json: strings.Replace(validCollectors, `aw.afk`, `aw\nafk`, 1), code: CodeInvalidCollector},
+		{name: "bucket id control character", json: strings.Replace(validCollectors, `aw-watcher-afk_host`, `aw-watcher-\u0001-host`, 1), code: CodeInvalidCollector},
+		{name: "missing explicit ActivityWatch clock error", json: strings.Replace(validCollectors, `,"clock_error_ms":100`, ``, 1), code: CodeDecodeFailed},
+		{name: "minimum generic collector", json: strings.Replace(validCollectors, `"kind":"media"`, `"kind":"generic_json"`, 1), code: CodeInvalidRuntime},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			prefix := `{"schema_version":1,"collectors":`
+			if test.name == "minimum generic collector" {
+				prefix = `{"schema_version":1,"runtime":{"mode":"minimum","backup_interface_enabled":true},"media_ingest":{"enabled":true,"ffprobe_path":"C:\\ffprobe.exe"},"collectors":`
+			}
+			_, err := Load(writeConfig(t, prefix+test.json+`}`), emptyEnvironment)
+			if err == nil || ErrorCode(err) != test.code {
+				t.Fatalf("Load() error=%v code=%q, want %q", err, ErrorCode(err), test.code)
+			}
+		})
+	}
+
+	t.Run("invalid UTF-8 is rejected before JSON decoding", func(t *testing.T) {
+		invalid := strings.Replace(validCollectors, "aw.afk", "aw."+string([]byte{0xff}), 1)
+		_, err := Load(writeConfig(t, `{"schema_version":1,"collectors":`+invalid+`}`), emptyEnvironment)
+		if err == nil || ErrorCode(err) != CodeDecodeFailed {
+			t.Fatalf("Load() error=%v code=%q", err, ErrorCode(err))
+		}
+	})
+
+	t.Run("enabled ActivityWatch count is bounded by offline SLA", func(t *testing.T) {
+		cfg, err := Load(writeConfig(t, `{"schema_version":1,"collectors":`+validCollectors+`}`), emptyEnvironment)
+		if err != nil {
+			t.Fatal(err)
+		}
+		template := cfg.Collectors[0]
+		cfg.Collectors = cfg.Collectors[1:]
+		for index := 0; index < 5; index++ {
+			collector := template
+			collector.ID = fmt.Sprintf("aw.%d", index)
+			activityWatch := *template.ActivityWatch
+			activityWatch.BucketID = fmt.Sprintf("bucket-%d", index)
+			collector.ActivityWatch = &activityWatch
+			cfg.Collectors = append(cfg.Collectors, collector)
+		}
+		if err := cfg.Validate(); err == nil || ErrorCode(err) != CodeInvalidCollector {
+			t.Fatalf("Validate() error=%v code=%q", err, ErrorCode(err))
+		}
+	})
+}
+
+func TestM3CollectorJSONRejectsUnknownAndDuplicateNestedFields(t *testing.T) {
+	tests := []string{
+		`{"schema_version":1,"collectors":[{"id":"x","kind":"generic_json","enabled":false,"extra":true}]}`,
+		`{"schema_version":1,"collectors":[{"id":"x","kind":"generic_json","enabled":false,"planned_schedule":{"timezone":"UTC","timezone":"Asia/Shanghai","windows":[]}}]}`,
+		`{"schema_version":1,"collectors":[{"id":"x","kind":"activitywatch","enabled":false,"activitywatch":{"base_url":"http://127.0.0.1:5600","unknown":true}}]}`,
+	}
+	for _, raw := range tests {
+		_, err := Load(writeConfig(t, raw), emptyEnvironment)
+		if err == nil || ErrorCode(err) != CodeDecodeFailed {
+			t.Fatalf("Load(%s) error=%v code=%q", raw, err, ErrorCode(err))
+		}
 	}
 }
 

@@ -12,6 +12,7 @@ import (
 	"os/signal"
 	"syscall"
 	"time"
+	_ "time/tzdata"
 
 	"github.com/Versifine/study-monitor/internal/app"
 	"github.com/Versifine/study-monitor/internal/config"
@@ -77,28 +78,44 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer, lookup co
 	}
 
 	if opts.check {
+		enabledCollectors := 0
+		enabledActivityWatch := 0
+		for _, collector := range cfg.Collectors {
+			if collector.Enabled {
+				enabledCollectors++
+				if collector.Kind == config.CollectorActivityWatch {
+					enabledActivityWatch++
+				}
+			}
+		}
 		result := struct {
-			Status        string `json:"status"`
-			SchemaVersion int    `json:"schema_version"`
-			ListenAddress string `json:"listen_address"`
-			DataDirectory string `json:"data_directory"`
-			DatabasePath  string `json:"database_path"`
-			LogLevel      string `json:"log_level"`
-			MediaEnabled  bool   `json:"media_ingest_enabled"`
-			MediaInbox    string `json:"media_inbox_directory"`
-			MediaStorage  string `json:"media_storage_directory"`
-			FFprobePath   string `json:"ffprobe_path,omitempty"`
+			Status                  string `json:"status"`
+			SchemaVersion           int    `json:"schema_version"`
+			ListenAddress           string `json:"listen_address"`
+			DataDirectory           string `json:"data_directory"`
+			DatabasePath            string `json:"database_path"`
+			LogLevel                string `json:"log_level"`
+			MediaEnabled            bool   `json:"media_ingest_enabled"`
+			MediaInbox              string `json:"media_inbox_directory"`
+			MediaStorage            string `json:"media_storage_directory"`
+			FFprobePath             string `json:"ffprobe_path,omitempty"`
+			Mode                    string `json:"mode"`
+			EnabledCollectors       int    `json:"enabled_collectors"`
+			ActivityWatchCollectors int    `json:"activitywatch_collectors"`
 		}{
-			Status:        "ok",
-			SchemaVersion: cfg.SchemaVersion,
-			ListenAddress: cfg.Server.ListenAddress,
-			DataDirectory: cfg.Paths.DataDirectory,
-			DatabasePath:  cfg.DatabasePath(),
-			LogLevel:      cfg.Logging.Level,
-			MediaEnabled:  cfg.MediaIngest.Enabled,
-			MediaInbox:    cfg.MediaIngest.InboxDirectory,
-			MediaStorage:  cfg.MediaStorageDirectory(),
-			FFprobePath:   cfg.MediaIngest.FFprobePath,
+			Status:                  "ok",
+			SchemaVersion:           cfg.SchemaVersion,
+			ListenAddress:           cfg.Server.ListenAddress,
+			DataDirectory:           cfg.Paths.DataDirectory,
+			DatabasePath:            cfg.DatabasePath(),
+			LogLevel:                cfg.Logging.Level,
+			MediaEnabled:            cfg.MediaIngest.Enabled,
+			MediaInbox:              cfg.MediaIngest.InboxDirectory,
+			MediaStorage:            cfg.MediaStorageDirectory(),
+			FFprobePath:             cfg.MediaIngest.FFprobePath,
+			Mode:                    cfg.Runtime.Mode,
+			EnabledCollectors:       enabledCollectors,
+			ActivityWatchCollectors: enabledActivityWatch,
 		}
 		if err := writeJSON(stdout, result); err != nil {
 			logger.Error("cli", "config_output_failed", "CLI_OUTPUT_FAILED", "write config validation output", err)
@@ -120,7 +137,7 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer, lookup co
 			app.ErrorCode(err),
 			"recorder core stopped unexpectedly",
 			err,
-			slog.String("mode", "record-only"),
+			slog.String("mode", cfg.Runtime.Mode),
 		)
 		return exitRuntime
 	}

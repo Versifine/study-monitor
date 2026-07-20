@@ -7,11 +7,14 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/Versifine/study-monitor/internal/strictjson"
 )
@@ -30,6 +33,9 @@ const (
 	CodeInvalidStorage    = "CONFIG_STORAGE_INVALID"
 	CodeInvalidAPILimit   = "CONFIG_API_LIMIT_INVALID"
 	CodeInvalidMedia      = "CONFIG_MEDIA_INGEST_INVALID"
+	CodeInvalidRuntime    = "CONFIG_RUNTIME_INVALID"
+	CodeInvalidCollector  = "CONFIG_COLLECTOR_INVALID"
+	CodeInvalidTimeline   = "CONFIG_TIMELINE_INVALID"
 	CodeInvalidLogLevel   = "CONFIG_LOG_LEVEL_INVALID"
 	CodeInvalidTimeout    = "CONFIG_TIMEOUT_INVALID"
 )
@@ -63,6 +69,7 @@ const (
 	EnvMediaScanEntries = "EXAM_MONITOR_MEDIA_MAX_SCAN_ENTRIES"
 	EnvFFprobePath      = "EXAM_MONITOR_FFPROBE_PATH"
 	EnvFFprobeTimeout   = "EXAM_MONITOR_FFPROBE_TIMEOUT"
+	EnvRuntimeMode      = "EXAM_MONITOR_MODE"
 
 	envLocalAppData = "LOCALAPPDATA"
 )
@@ -70,15 +77,73 @@ const (
 // LookupEnv matches os.LookupEnv and makes environment overrides deterministic in tests.
 type LookupEnv func(string) (string, bool)
 
-// Config is the complete M2 configuration contract.
+// Config is the complete Recorder Core configuration contract through M3.
 type Config struct {
 	SchemaVersion int               `json:"schema_version"`
+	Runtime       RuntimeConfig     `json:"runtime"`
 	Server        ServerConfig      `json:"server"`
 	Paths         PathsConfig       `json:"paths"`
 	Storage       StorageConfig     `json:"storage"`
 	API           APIConfig         `json:"api"`
 	MediaIngest   MediaIngestConfig `json:"media_ingest"`
+	Collectors    []CollectorConfig `json:"collectors"`
+	Timeline      TimelineConfig    `json:"timeline"`
 	Logging       LoggingConfig     `json:"logging"`
+}
+
+const (
+	ModeRecordOnly = "record-only"
+	ModeMinimum    = "minimum"
+
+	CollectorActivityWatch = "activitywatch"
+	CollectorGenericJSON   = "generic_json"
+	CollectorMedia         = "media"
+)
+
+type RuntimeConfig struct {
+	Mode                   string `json:"mode"`
+	BackupInterfaceEnabled bool   `json:"backup_interface_enabled"`
+}
+
+type CollectorConfig struct {
+	ID              string                `json:"id"`
+	Kind            string                `json:"kind"`
+	Enabled         bool                  `json:"enabled"`
+	HeartbeatPeriod string                `json:"heartbeat_period"`
+	AllowedLateness string                `json:"allowed_lateness"`
+	OfflineAfter    string                `json:"offline_after"`
+	PlannedSchedule PlannedScheduleConfig `json:"planned_schedule"`
+	ActivityWatch   *ActivityWatchConfig  `json:"activitywatch,omitempty"`
+}
+
+type PlannedScheduleConfig struct {
+	Timezone string                 `json:"timezone"`
+	Windows  []ScheduleWindowConfig `json:"windows"`
+}
+
+type ScheduleWindowConfig struct {
+	Days       []string `json:"days"`
+	StartLocal string   `json:"start_local"`
+	EndLocal   string   `json:"end_local"`
+}
+
+type ActivityWatchConfig struct {
+	BaseURL          string `json:"base_url"`
+	BucketID         string `json:"bucket_id"`
+	PollInterval     string `json:"poll_interval"`
+	RequestTimeout   string `json:"request_timeout"`
+	InitialLookback  string `json:"initial_lookback"`
+	RescanWindow     string `json:"rescan_window"`
+	PageSize         int    `json:"page_size"`
+	MaxPagesPerPoll  int    `json:"max_pages_per_poll"`
+	MaxResponseBytes int64  `json:"max_response_bytes"`
+	ClockErrorMS     int64  `json:"clock_error_ms"`
+}
+
+type TimelineConfig struct {
+	ClockUncertainAfter string `json:"clock_uncertain_after"`
+	MaxQueryRange       string `json:"max_query_range"`
+	MaxProjectionFacts  int    `json:"max_projection_facts"`
 }
 
 type ServerConfig struct {
@@ -148,6 +213,10 @@ func ErrorCode(err error) string {
 func defaultConfig() Config {
 	return Config{
 		SchemaVersion: CurrentSchemaVersion,
+		Runtime: RuntimeConfig{
+			Mode:                   ModeRecordOnly,
+			BackupInterfaceEnabled: true,
+		},
 		Server: ServerConfig{
 			ListenAddress:    "127.0.0.1:47831",
 			AllowNonLoopback: false,
@@ -181,6 +250,12 @@ func defaultConfig() Config {
 			MaxSidecarBytes:    64 << 10,
 			MaxScanEntries:     1000,
 			FFprobeTimeout:     "30s",
+		},
+		Collectors: []CollectorConfig{},
+		Timeline: TimelineConfig{
+			ClockUncertainAfter: "1s",
+			MaxQueryRange:       "744h",
+			MaxProjectionFacts:  100000,
 		},
 		Logging: LoggingConfig{Level: "info"},
 	}
@@ -217,10 +292,13 @@ func Load(path string, lookup LookupEnv) (Config, error) {
 
 func decodeFile(raw []byte, cfg *Config) error {
 	raw = bytes.TrimPrefix(raw, []byte{0xEF, 0xBB, 0xBF})
+	if !utf8.Valid(raw) {
+		return &Error{Code: CodeDecodeFailed, Err: errors.New("config JSON must be valid UTF-8")}
+	}
 	if err := strictjson.ValidateObjectKeys(raw, 0); err != nil {
 		return &Error{Code: CodeDecodeFailed, Err: errors.New("config JSON contains a duplicate key or is invalid")}
 	}
-	rootFields := []string{"schema_version", "server", "paths", "storage", "api", "media_ingest", "logging"}
+	rootFields := []string{"schema_version", "runtime", "server", "paths", "storage", "api", "media_ingest", "collectors", "timeline", "logging"}
 	if err := strictjson.ValidateExactRootObject(raw, 1, rootFields...); err != nil {
 		return &Error{Code: CodeDecodeFailed, Err: errors.New("config root fields must exactly match the versioned schema")}
 	}
@@ -236,11 +314,13 @@ func decodeFile(raw []byte, cfg *Config) error {
 		name    string
 		allowed []string
 	}{
+		{name: "runtime", allowed: []string{"mode", "backup_interface_enabled"}},
 		{name: "server", allowed: []string{"listen_address", "allow_non_loopback", "read_header_timeout", "read_timeout", "write_timeout", "idle_timeout", "shutdown_timeout"}},
 		{name: "paths", allowed: []string{"data_directory"}},
 		{name: "storage", allowed: []string{"busy_timeout", "max_open_connections"}},
 		{name: "api", allowed: []string{"max_request_bytes", "max_batch_events", "max_event_bytes", "max_payload_depth", "max_concurrent_writes", "default_page_size", "max_page_size"}},
 		{name: "media_ingest", allowed: []string{"enabled", "inbox_directory", "scan_interval", "settle_interval", "max_segment_bytes", "max_segment_duration", "max_sidecar_bytes", "max_scan_entries", "ffprobe_path", "ffprobe_timeout"}},
+		{name: "timeline", allowed: []string{"clock_uncertain_after", "max_query_range", "max_projection_facts"}},
 		{name: "logging", allowed: []string{"level"}},
 	}
 	for _, section := range sections {
@@ -248,6 +328,11 @@ func decodeFile(raw []byte, cfg *Config) error {
 			if err := strictjson.ValidateExactRootObject(value, 1, section.allowed...); err != nil {
 				return &Error{Code: CodeDecodeFailed, Err: fmt.Errorf("config section %s fields must exactly match the versioned schema", section.name)}
 			}
+		}
+	}
+	if value, ok := fields["collectors"]; ok {
+		if err := validateCollectorJSON(value); err != nil {
+			return &Error{Code: CodeDecodeFailed, Err: err}
 		}
 	}
 
@@ -273,7 +358,68 @@ func ensureEOF(decoder *json.Decoder) error {
 	return nil
 }
 
+func validateCollectorJSON(raw json.RawMessage) error {
+	var collectors []json.RawMessage
+	if err := json.Unmarshal(raw, &collectors); err != nil {
+		return errors.New("config collectors must be an array")
+	}
+	for index, collectorRaw := range collectors {
+		if err := strictjson.ValidateExactRootObject(collectorRaw, 1,
+			"id", "kind", "enabled", "heartbeat_period", "allowed_lateness", "offline_after", "planned_schedule", "activitywatch"); err != nil {
+			return fmt.Errorf("config collector %d fields must match the versioned schema", index)
+		}
+		var collector map[string]json.RawMessage
+		if err := json.Unmarshal(collectorRaw, &collector); err != nil {
+			return fmt.Errorf("config collector %d is invalid", index)
+		}
+		var collectorHeader struct {
+			Kind    string `json:"kind"`
+			Enabled bool   `json:"enabled"`
+		}
+		if err := json.Unmarshal(collectorRaw, &collectorHeader); err != nil {
+			return fmt.Errorf("config collector %d is invalid", index)
+		}
+		if scheduleRaw, ok := collector["planned_schedule"]; ok {
+			if err := strictjson.ValidateExactRootObject(scheduleRaw, 1, "timezone", "windows"); err != nil {
+				return fmt.Errorf("config collector %d planned_schedule fields must match the versioned schema", index)
+			}
+			var schedule struct {
+				Windows []json.RawMessage `json:"windows"`
+			}
+			if err := json.Unmarshal(scheduleRaw, &schedule); err != nil {
+				return fmt.Errorf("config collector %d planned_schedule is invalid", index)
+			}
+			for windowIndex, windowRaw := range schedule.Windows {
+				if err := strictjson.ValidateExactRootObject(windowRaw, 1, "days", "start_local", "end_local"); err != nil {
+					return fmt.Errorf("config collector %d schedule window %d fields must match the versioned schema", index, windowIndex)
+				}
+			}
+		}
+		if activityWatchRaw, ok := collector["activitywatch"]; ok {
+			activityWatchFields := []string{"base_url", "bucket_id", "poll_interval", "request_timeout", "initial_lookback", "rescan_window", "page_size", "max_pages_per_poll", "max_response_bytes", "clock_error_ms"}
+			if err := strictjson.ValidateExactRootObject(activityWatchRaw, 1, activityWatchFields...); err != nil {
+				return fmt.Errorf("config collector %d activitywatch fields must match the versioned schema", index)
+			}
+			if collectorHeader.Enabled && collectorHeader.Kind == CollectorActivityWatch {
+				var fields map[string]json.RawMessage
+				if err := json.Unmarshal(activityWatchRaw, &fields); err != nil {
+					return fmt.Errorf("config collector %d activitywatch settings are invalid", index)
+				}
+				for _, field := range activityWatchFields {
+					if _, exists := fields[field]; !exists {
+						return fmt.Errorf("config collector %d activitywatch field %s is required", index, field)
+					}
+				}
+			}
+		}
+	}
+	return nil
+}
+
 func applyEnvironment(cfg *Config, lookup LookupEnv) error {
+	if value, ok := lookup(EnvRuntimeMode); ok {
+		cfg.Runtime.Mode = value
+	}
 	if value, ok := lookup(EnvListenAddress); ok {
 		cfg.Server.ListenAddress = value
 	}
@@ -465,6 +611,9 @@ func (cfg Config) Validate() error {
 	if !filepath.IsAbs(cfg.Paths.DataDirectory) {
 		return &Error{Code: CodeInvalidDataDir, Err: errors.New("paths.data_directory must resolve to an absolute filesystem path")}
 	}
+	if cfg.Runtime.Mode != ModeRecordOnly && cfg.Runtime.Mode != ModeMinimum {
+		return &Error{Code: CodeInvalidRuntime, Err: errors.New("runtime.mode must be record-only or minimum")}
+	}
 
 	switch strings.ToLower(cfg.Logging.Level) {
 	case "debug", "info", "warn", "error":
@@ -544,7 +693,218 @@ func (cfg Config) Validate() error {
 	if cfg.MediaIngest.Enabled && !filepath.IsAbs(cfg.MediaIngest.FFprobePath) {
 		return &Error{Code: CodeInvalidMedia, Err: errors.New("media_ingest.ffprobe_path must be absolute when media ingest is enabled")}
 	}
+	if err := cfg.validateTimeline(); err != nil {
+		return err
+	}
+	if err := cfg.validateCollectors(); err != nil {
+		return err
+	}
 	return nil
+}
+
+func (cfg Config) validateTimeline() error {
+	uncertain, err := time.ParseDuration(cfg.Timeline.ClockUncertainAfter)
+	if err != nil || uncertain < time.Millisecond || uncertain > 24*time.Hour {
+		return &Error{Code: CodeInvalidTimeline, Err: errors.New("timeline.clock_uncertain_after must be between 1ms and 24h")}
+	}
+	queryRange, err := time.ParseDuration(cfg.Timeline.MaxQueryRange)
+	if err != nil || queryRange < time.Minute || queryRange > 366*24*time.Hour {
+		return &Error{Code: CodeInvalidTimeline, Err: errors.New("timeline.max_query_range must be between 1m and 8784h")}
+	}
+	if cfg.Timeline.MaxProjectionFacts < 100 || cfg.Timeline.MaxProjectionFacts > 1000000 {
+		return &Error{Code: CodeInvalidTimeline, Err: errors.New("timeline.max_projection_facts must be between 100 and 1000000")}
+	}
+	return nil
+}
+
+func (cfg Config) validateCollectors() error {
+	if len(cfg.Collectors) > 64 {
+		return &Error{Code: CodeInvalidCollector, Err: errors.New("collectors cannot contain more than 64 entries")}
+	}
+	seen := make(map[string]struct{}, len(cfg.Collectors))
+	enabledActivityWatch := 0
+	enabledMedia := 0
+	for index := range cfg.Collectors {
+		collector := &cfg.Collectors[index]
+		if !validConfigIdentifier(collector.ID, 128) {
+			return &Error{Code: CodeInvalidCollector, Err: fmt.Errorf("collectors[%d].id is invalid", index)}
+		}
+		if _, exists := seen[collector.ID]; exists {
+			return &Error{Code: CodeInvalidCollector, Err: fmt.Errorf("collector id %q is duplicated", collector.ID)}
+		}
+		seen[collector.ID] = struct{}{}
+		switch collector.Kind {
+		case CollectorActivityWatch, CollectorGenericJSON, CollectorMedia:
+		default:
+			return &Error{Code: CodeInvalidCollector, Err: fmt.Errorf("collectors[%d].kind is unsupported", index)}
+		}
+		if !collector.Enabled {
+			continue
+		}
+		heartbeat, err := parseCollectorDuration("heartbeat_period", collector.HeartbeatPeriod, time.Second, 10*time.Minute)
+		if err != nil {
+			return err
+		}
+		lateness, err := parseCollectorDuration("allowed_lateness", collector.AllowedLateness, 0, time.Hour)
+		if err != nil {
+			return err
+		}
+		offline, err := parseCollectorDuration("offline_after", collector.OfflineAfter, time.Second, 24*time.Hour)
+		if err != nil {
+			return err
+		}
+		if heartbeat+lateness > offline {
+			return &Error{Code: CodeInvalidCollector, Err: fmt.Errorf("collector %q must satisfy heartbeat_period + allowed_lateness <= offline_after", collector.ID)}
+		}
+		if err := validateSchedule(collector.ID, collector.PlannedSchedule); err != nil {
+			return err
+		}
+		switch collector.Kind {
+		case CollectorActivityWatch:
+			enabledActivityWatch++
+			if offline > 5*time.Minute {
+				return &Error{Code: CodeInvalidCollector, Err: fmt.Errorf("ActivityWatch collector %q offline_after exceeds the V1 5m SLA", collector.ID)}
+			}
+			if err := validateActivityWatch(collector.ID, collector.ActivityWatch, cfg.API.MaxBatchEvents, heartbeat); err != nil {
+				return err
+			}
+		case CollectorMedia:
+			enabledMedia++
+			if offline > 15*time.Minute {
+				return &Error{Code: CodeInvalidCollector, Err: fmt.Errorf("media collector %q offline_after exceeds the V1 15m SLA", collector.ID)}
+			}
+			if collector.ActivityWatch != nil {
+				return &Error{Code: CodeInvalidCollector, Err: fmt.Errorf("media collector %q must not configure activitywatch", collector.ID)}
+			}
+		case CollectorGenericJSON:
+			if collector.ActivityWatch != nil {
+				return &Error{Code: CodeInvalidCollector, Err: fmt.Errorf("generic JSON collector %q must not configure activitywatch", collector.ID)}
+			}
+		}
+	}
+	if cfg.Runtime.Mode == ModeMinimum {
+		if !cfg.Runtime.BackupInterfaceEnabled {
+			return &Error{Code: CodeInvalidRuntime, Err: errors.New("minimum mode requires the backup interface")}
+		}
+		if enabledActivityWatch == 0 || enabledMedia == 0 || !cfg.MediaIngest.Enabled {
+			return &Error{Code: CodeInvalidRuntime, Err: errors.New("minimum mode requires enabled ActivityWatch and media collectors plus media ingest")}
+		}
+		for _, collector := range cfg.Collectors {
+			if collector.Enabled && collector.Kind != CollectorActivityWatch && collector.Kind != CollectorMedia {
+				return &Error{Code: CodeInvalidRuntime, Err: errors.New("minimum mode may enable only ActivityWatch and media collectors")}
+			}
+		}
+	}
+	if enabledActivityWatch > 4 {
+		return &Error{Code: CodeInvalidCollector, Err: errors.New("Version 1 supports at most 4 enabled ActivityWatch collectors so every poll stays within the offline SLA")}
+	}
+	return nil
+}
+
+func validateActivityWatch(collectorID string, aw *ActivityWatchConfig, maxBatch int, heartbeatPeriod time.Duration) error {
+	if aw == nil {
+		return &Error{Code: CodeInvalidCollector, Err: fmt.Errorf("ActivityWatch collector %q requires activitywatch settings", collectorID)}
+	}
+	parsed, err := url.Parse(aw.BaseURL)
+	if err != nil || parsed.Scheme != "http" || parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" || (parsed.Path != "" && parsed.Path != "/") {
+		return &Error{Code: CodeInvalidCollector, Err: fmt.Errorf("ActivityWatch collector %q base_url must be a plain loopback HTTP origin", collectorID)}
+	}
+	host := parsed.Hostname()
+	ip := net.ParseIP(host)
+	port, portErr := strconv.Atoi(parsed.Port())
+	if ip == nil || !ip.IsLoopback() || portErr != nil || port < 1 || port > 65535 {
+		return &Error{Code: CodeInvalidCollector, Err: fmt.Errorf("ActivityWatch collector %q base_url must use a loopback IP and explicit port", collectorID)}
+	}
+	if !validConfigIdentifier(aw.BucketID, 256) || strings.ContainsAny(aw.BucketID, "/\\?#") {
+		return &Error{Code: CodeInvalidCollector, Err: fmt.Errorf("ActivityWatch collector %q bucket_id is invalid", collectorID)}
+	}
+	for name, value := range map[string]string{
+		"poll_interval": aw.PollInterval, "request_timeout": aw.RequestTimeout,
+		"initial_lookback": aw.InitialLookback, "rescan_window": aw.RescanWindow,
+	} {
+		duration, err := time.ParseDuration(value)
+		if err != nil || duration <= 0 || duration > 366*24*time.Hour {
+			return &Error{Code: CodeInvalidCollector, Err: fmt.Errorf("ActivityWatch collector %q %s is invalid", collectorID, name)}
+		}
+	}
+	if poll, _ := time.ParseDuration(aw.PollInterval); poll < time.Second || poll > 10*time.Minute {
+		return &Error{Code: CodeInvalidCollector, Err: fmt.Errorf("ActivityWatch collector %q poll_interval must be between 1s and 10m", collectorID)}
+	}
+	if poll, _ := time.ParseDuration(aw.PollInterval); poll > heartbeatPeriod {
+		return &Error{Code: CodeInvalidCollector, Err: fmt.Errorf("ActivityWatch collector %q poll_interval must not exceed heartbeat_period", collectorID)}
+	}
+	if timeout, _ := time.ParseDuration(aw.RequestTimeout); timeout < 100*time.Millisecond || timeout > time.Minute {
+		return &Error{Code: CodeInvalidCollector, Err: fmt.Errorf("ActivityWatch collector %q request_timeout must be between 100ms and 1m", collectorID)}
+	}
+	if aw.PageSize < 1 || aw.PageSize > maxBatch || aw.MaxPagesPerPoll < 1 || aw.MaxPagesPerPoll > 100 || aw.MaxResponseBytes < 1024 || aw.MaxResponseBytes > 8<<20 || aw.ClockErrorMS < 0 || aw.ClockErrorMS > 24*60*60*1000 {
+		return &Error{Code: CodeInvalidCollector, Err: fmt.Errorf("ActivityWatch collector %q paging, response, or clock limits are invalid", collectorID)}
+	}
+	return nil
+}
+
+func validateSchedule(collectorID string, schedule PlannedScheduleConfig) error {
+	if schedule.Timezone == "" || schedule.Timezone == "Local" {
+		return &Error{Code: CodeInvalidCollector, Err: fmt.Errorf("collector %q planned_schedule.timezone is required", collectorID)}
+	}
+	if _, err := time.LoadLocation(schedule.Timezone); err != nil {
+		return &Error{Code: CodeInvalidCollector, Err: fmt.Errorf("collector %q planned_schedule.timezone is invalid", collectorID)}
+	}
+	if len(schedule.Windows) == 0 || len(schedule.Windows) > 64 {
+		return &Error{Code: CodeInvalidCollector, Err: fmt.Errorf("collector %q planned_schedule.windows must contain 1 to 64 entries", collectorID)}
+	}
+	validDays := map[string]bool{"monday": true, "tuesday": true, "wednesday": true, "thursday": true, "friday": true, "saturday": true, "sunday": true}
+	for index, window := range schedule.Windows {
+		if len(window.Days) == 0 || len(window.Days) > 7 {
+			return &Error{Code: CodeInvalidCollector, Err: fmt.Errorf("collector %q schedule window %d days are invalid", collectorID, index)}
+		}
+		seenDays := map[string]bool{}
+		for _, day := range window.Days {
+			if !validDays[day] || seenDays[day] {
+				return &Error{Code: CodeInvalidCollector, Err: fmt.Errorf("collector %q schedule window %d contains an invalid or duplicate day", collectorID, index)}
+			}
+			seenDays[day] = true
+		}
+		start, ok := parseClockMinute(window.StartLocal, false)
+		if !ok {
+			return &Error{Code: CodeInvalidCollector, Err: fmt.Errorf("collector %q schedule window %d start_local is invalid", collectorID, index)}
+		}
+		end, ok := parseClockMinute(window.EndLocal, true)
+		if !ok || start >= end {
+			return &Error{Code: CodeInvalidCollector, Err: fmt.Errorf("collector %q schedule window %d must satisfy start_local < end_local", collectorID, index)}
+		}
+	}
+	return nil
+}
+
+func parseClockMinute(value string, allowEndOfDay bool) (int, bool) {
+	if allowEndOfDay && value == "24:00" {
+		return 24 * 60, true
+	}
+	parsed, err := time.Parse("15:04", value)
+	if err != nil || parsed.Format("15:04") != value {
+		return 0, false
+	}
+	return parsed.Hour()*60 + parsed.Minute(), true
+}
+
+func parseCollectorDuration(name, value string, minimum, maximum time.Duration) (time.Duration, error) {
+	duration, err := time.ParseDuration(value)
+	if err != nil || duration < minimum || duration > maximum {
+		return 0, &Error{Code: CodeInvalidCollector, Err: fmt.Errorf("collector %s must be between %s and %s", name, minimum, maximum)}
+	}
+	return duration, nil
+}
+
+func validConfigIdentifier(value string, maximum int) bool {
+	if value == "" || len(value) > maximum || strings.TrimSpace(value) != value || !utf8.ValidString(value) {
+		return false
+	}
+	for _, character := range value {
+		if unicode.IsControl(character) {
+			return false
+		}
+	}
+	return true
 }
 
 func validateMediaDuration(name, value string, minimum, maximum time.Duration) (time.Duration, error) {
@@ -621,5 +981,50 @@ func (cfg Config) MediaMaxSegmentDuration() time.Duration {
 
 func (cfg Config) FFprobeTimeout() time.Duration {
 	duration, _ := time.ParseDuration(cfg.MediaIngest.FFprobeTimeout)
+	return duration
+}
+
+func (cfg Config) ClockUncertainAfter() time.Duration {
+	duration, _ := time.ParseDuration(cfg.Timeline.ClockUncertainAfter)
+	return duration
+}
+
+func (cfg Config) TimelineMaxQueryRange() time.Duration {
+	duration, _ := time.ParseDuration(cfg.Timeline.MaxQueryRange)
+	return duration
+}
+
+func (collector CollectorConfig) HeartbeatPeriodDuration() time.Duration {
+	duration, _ := time.ParseDuration(collector.HeartbeatPeriod)
+	return duration
+}
+
+func (collector CollectorConfig) AllowedLatenessDuration() time.Duration {
+	duration, _ := time.ParseDuration(collector.AllowedLateness)
+	return duration
+}
+
+func (collector CollectorConfig) OfflineAfterDuration() time.Duration {
+	duration, _ := time.ParseDuration(collector.OfflineAfter)
+	return duration
+}
+
+func (aw ActivityWatchConfig) PollIntervalDuration() time.Duration {
+	duration, _ := time.ParseDuration(aw.PollInterval)
+	return duration
+}
+
+func (aw ActivityWatchConfig) RequestTimeoutDuration() time.Duration {
+	duration, _ := time.ParseDuration(aw.RequestTimeout)
+	return duration
+}
+
+func (aw ActivityWatchConfig) InitialLookbackDuration() time.Duration {
+	duration, _ := time.ParseDuration(aw.InitialLookback)
+	return duration
+}
+
+func (aw ActivityWatchConfig) RescanWindowDuration() time.Duration {
+	duration, _ := time.ParseDuration(aw.RescanWindow)
 	return duration
 }

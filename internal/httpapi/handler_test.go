@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Versifine/study-monitor/internal/collectors"
 	"github.com/Versifine/study-monitor/internal/config"
 	"github.com/Versifine/study-monitor/internal/eventstore"
 	"github.com/Versifine/study-monitor/internal/logging"
@@ -325,6 +326,132 @@ func TestWriteConcurrencyLimitFailsFast(t *testing.T) {
 	}
 }
 
+func TestProjectionConcurrencyLimitFailsFastAcrossTimelineAndCoverage(t *testing.T) {
+	cfg := testConfig(t)
+	store := &blockingStore{queryEntered: make(chan struct{}), queryRelease: make(chan struct{})}
+	handler := New(cfg, testLogger(t), version.Info{Version: "test"}, store, StorageFailure{})
+	firstDone := make(chan *httptest.ResponseRecorder, 1)
+	go func() {
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/api/v1/timeline?start=2026-07-20T00:00:00Z&end=2026-07-20T00:10:00Z", nil))
+		firstDone <- response
+	}()
+	select {
+	case <-store.queryEntered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("first projection did not enter the store")
+	}
+	second := httptest.NewRecorder()
+	handler.ServeHTTP(second, httptest.NewRequest(http.MethodGet, "/api/v1/coverage?start=2026-07-20T00:00:00Z&end=2026-07-20T00:10:00Z", nil))
+	if second.Code != http.StatusTooManyRequests || responseErrorCode(t, second) != CodeProjectionLimit {
+		t.Fatalf("concurrent projection status=%d body=%s", second.Code, second.Body.String())
+	}
+	close(store.queryRelease)
+	if first := <-firstDone; first.Code != http.StatusOK {
+		t.Fatalf("first projection status=%d body=%s", first.Code, first.Body.String())
+	}
+}
+
+func TestMinimumModeDisablesBothGenericEvidenceAliasesAndExternalHeartbeats(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.Runtime.Mode = config.ModeMinimum
+	handler := New(cfg, testLogger(t), version.Info{Version: "test"}, &blockingStore{}, StorageFailure{})
+	for _, path := range []string{"/api/v1/events/batch", "/api/v1/evidence/batch", "/api/v1/collectors/heartbeats/batch"} {
+		response := httptest.NewRecorder()
+		request := httptest.NewRequest(http.MethodPost, path, strings.NewReader(`{"schema_version":1}`))
+		request.Header.Set("Content-Type", "application/json")
+		handler.ServeHTTP(response, request)
+		if response.Code != http.StatusNotFound || responseErrorCode(t, response) != CodeModuleDisabled {
+			t.Fatalf("minimum endpoint %s status=%d body=%s", path, response.Code, response.Body.String())
+		}
+	}
+}
+
+func TestM3EvidenceHeartbeatTimelineCoverageAndStatusEndpoints(t *testing.T) {
+	handler, store, cfg := newM3IntegratedHandler(t)
+	defer store.Close()
+	now := time.Now().UTC().Truncate(time.Second)
+	eventTime := now.Add(-10 * time.Minute).Format(time.RFC3339Nano)
+	event := fmt.Sprintf(`{"schema_version":1,"collector_id":"generic.one","event_type":"generic.evidence","device_timestamp_raw":%q,"clock_offset_ms":250,"clock_error_ms":5000,"idempotency_key":"m3-api-event","payload":{"source":"phone-json"}}`, eventTime)
+	evidence := performJSON(handler, http.MethodPost, "/api/v1/evidence/batch", fmt.Sprintf(`{"schema_version":1,"events":[%s]}`, event), nil)
+	if evidence.Code != http.StatusOK {
+		t.Fatalf("evidence status=%d body=%s", evidence.Code, evidence.Body.String())
+	}
+	var evidenceResult batchResponse
+	decodeResponse(t, evidence, &evidenceResult)
+	if evidenceResult.Results[0].Status != eventstore.StatusAccepted {
+		t.Fatalf("evidence results=%#v", evidenceResult.Results)
+	}
+
+	heartbeatStart := now.Add(-9 * time.Minute)
+	heartbeatEnd := heartbeatStart.Add(time.Minute)
+	heartbeat := fmt.Sprintf(`{"schema_version":1,"collector_id":"generic.one","state":"idle","device_start_raw":%q,"device_end_raw":%q,"clock_offset_ms":0,"clock_error_ms":25,"idempotency_key":"m3-api-heartbeat","quality_flags":[]}`, heartbeatStart.Format(time.RFC3339Nano), heartbeatEnd.Format(time.RFC3339Nano))
+	body := fmt.Sprintf(`{"schema_version":1,"heartbeats":[%s]}`, heartbeat)
+	accepted := performJSON(handler, http.MethodPost, "/api/v1/collectors/heartbeats/batch", body, nil)
+	duplicate := performJSON(handler, http.MethodPost, "/api/v1/collectors/heartbeats/batch", body, nil)
+	var acceptedBody, duplicateBody struct {
+		Results []eventstore.HeartbeatWriteResult `json:"results"`
+	}
+	decodeResponse(t, accepted, &acceptedBody)
+	decodeResponse(t, duplicate, &duplicateBody)
+	if accepted.Code != http.StatusOK || duplicate.Code != http.StatusOK || acceptedBody.Results[0].Status != eventstore.StatusAccepted || duplicateBody.Results[0].Status != eventstore.StatusDuplicate || duplicateBody.Results[0].HeartbeatID != acceptedBody.Results[0].HeartbeatID {
+		t.Fatalf("heartbeat accepted=%#v duplicate=%#v", acceptedBody, duplicateBody)
+	}
+
+	start := url.QueryEscape(now.Add(-15 * time.Minute).Format(time.RFC3339Nano))
+	end := url.QueryEscape(now.Add(time.Minute).Format(time.RFC3339Nano))
+	timelineResponse := httptest.NewRecorder()
+	handler.ServeHTTP(timelineResponse, httptest.NewRequest(http.MethodGet, "/api/v1/timeline?start="+start+"&end="+end+"&limit=10", nil))
+	var timeline struct {
+		SchemaVersion int                        `json:"schema_version"`
+		Entries       []eventstore.TimelineEntry `json:"entries"`
+	}
+	decodeResponse(t, timelineResponse, &timeline)
+	if timelineResponse.Code != http.StatusOK || timeline.SchemaVersion != 1 || len(timeline.Entries) != 2 {
+		t.Fatalf("timeline status=%d body=%s", timelineResponse.Code, timelineResponse.Body.String())
+	}
+	if timeline.Entries[0].CorrectedStartUTC == "" || timeline.Entries[0].ReceivedAtUTC == "" || timeline.Entries[0].DeviceStartRaw == "" || timeline.Entries[0].DeviceStartUTC == "" || timeline.Entries[0].StableID == "" {
+		t.Fatalf("timeline omits clock evidence or stable identity: %#v", timeline.Entries[0])
+	}
+	if !timeline.Entries[0].ClockUncertain {
+		t.Fatalf("large clock error was not explicit: %#v", timeline.Entries[0])
+	}
+
+	coverageResponse := httptest.NewRecorder()
+	handler.ServeHTTP(coverageResponse, httptest.NewRequest(http.MethodGet, "/api/v1/coverage?start="+start+"&end="+end+"&collector_id=generic.one", nil))
+	var coverage struct {
+		SchemaVersion int                                   `json:"schema_version"`
+		Projections   []eventstore.CoverageProjectionStatus `json:"projections"`
+		Intervals     []eventstore.CoverageInterval         `json:"intervals"`
+	}
+	decodeResponse(t, coverageResponse, &coverage)
+	if coverageResponse.Code != http.StatusOK || len(coverage.Projections) != 1 || coverage.Projections[0].Status != "fresh" || len(coverage.Intervals) == 0 {
+		t.Fatalf("coverage status=%d body=%s", coverageResponse.Code, coverageResponse.Body.String())
+	}
+	for index := 1; index < len(coverage.Intervals); index++ {
+		if coverage.Intervals[index].StartUTC < coverage.Intervals[index-1].EndUTC {
+			t.Fatalf("coverage intervals overlap: %#v", coverage.Intervals)
+		}
+	}
+
+	statusResponse := httptest.NewRecorder()
+	handler.ServeHTTP(statusResponse, httptest.NewRequest(http.MethodGet, "/api/v1/collectors/status", nil))
+	var statuses struct {
+		Collectors []collectors.Status `json:"collectors"`
+	}
+	decodeResponse(t, statusResponse, &statuses)
+	if statusResponse.Code != http.StatusOK || len(statuses.Collectors) != 1 || statuses.Collectors[0].CollectorID != "generic.one" {
+		t.Fatalf("collector status=%d body=%s", statusResponse.Code, statusResponse.Body.String())
+	}
+
+	badRange := httptest.NewRecorder()
+	handler.ServeHTTP(badRange, httptest.NewRequest(http.MethodGet, "/api/v1/timeline?start=2026-01-01T00:00:00-00:00&end=2026-01-01T01:00:00Z", nil))
+	if badRange.Code != http.StatusBadRequest || responseErrorCode(t, badRange) != CodeQueryInvalid {
+		t.Fatalf("unknown-offset range status=%d body=%s", badRange.Code, badRange.Body.String())
+	}
+	_ = cfg
+}
+
 type batchResponse struct {
 	SchemaVersion int                      `json:"schema_version"`
 	Results       []eventstore.WriteResult `json:"results"`
@@ -338,13 +465,19 @@ type queryResponse struct {
 }
 
 type blockingStore struct {
-	entered chan struct{}
-	release chan struct{}
+	entered      chan struct{}
+	release      chan struct{}
+	queryEntered chan struct{}
+	queryRelease chan struct{}
 }
 
 type mediaStatusStub struct {
 	status mediaingest.Status
 }
+
+type collectorStatusStub struct{ statuses []collectors.Status }
+
+func (stub collectorStatusStub) Status(context.Context) []collectors.Status { return stub.statuses }
 
 func (stub *mediaStatusStub) Status(context.Context) mediaingest.Status { return stub.status }
 
@@ -352,6 +485,22 @@ func (store *blockingStore) AppendBatch(_ context.Context, _ []eventstore.Candid
 	close(store.entered)
 	<-store.release
 	return []eventstore.WriteResult{{Index: 0, Status: eventstore.StatusAccepted, EventID: 1}}, nil
+}
+
+func (*blockingStore) AppendHeartbeatBatch(context.Context, []eventstore.HeartbeatCandidate) ([]eventstore.HeartbeatWriteResult, error) {
+	return nil, nil
+}
+
+func (store *blockingStore) QueryTimeline(context.Context, time.Time, time.Time, string, int, time.Duration, int) (eventstore.TimelinePage, error) {
+	if store.queryEntered != nil {
+		close(store.queryEntered)
+		<-store.queryRelease
+	}
+	return eventstore.TimelinePage{}, nil
+}
+
+func (*blockingStore) RebuildCoverage(context.Context, []config.CollectorConfig, time.Time, time.Time, time.Time, time.Duration, int) (eventstore.CoverageResult, error) {
+	return eventstore.CoverageResult{}, nil
 }
 
 func (*blockingStore) QueryPage(context.Context, string, int) (eventstore.Page, error) {
@@ -375,6 +524,27 @@ func newIntegratedHandler(t *testing.T) (*Handler, *eventstore.Store, config.Con
 		t.Fatal(err)
 	}
 	return New(cfg, testLogger(t), version.Info{Version: "0.2.0-test"}, store, StorageFailure{}), store, cfg
+}
+
+func newM3IntegratedHandler(t *testing.T) (*Handler, *eventstore.Store, config.Config) {
+	t.Helper()
+	cfg := testConfig(t)
+	cfg.Collectors = []config.CollectorConfig{{
+		ID: "generic.one", Kind: config.CollectorGenericJSON, Enabled: true,
+		HeartbeatPeriod: "1m", AllowedLateness: "1m", OfflineAfter: "5m",
+		PlannedSchedule: config.PlannedScheduleConfig{Timezone: "UTC", Windows: []config.ScheduleWindowConfig{{Days: []string{"monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"}, StartLocal: "00:00", EndLocal: "24:00"}}},
+	}}
+	store, err := eventstore.Open(context.Background(), cfg.DatabasePath(), eventstore.Options{
+		BusyTimeout: cfg.BusyTimeout(), MaxOpenConnections: cfg.Storage.MaxOpenConnections,
+		MaxBatchEvents: cfg.API.MaxBatchEvents, MaxEventBytes: cfg.API.MaxEventBytes,
+		MaxPayloadDepth: cfg.API.MaxPayloadDepth, MaxPageSize: cfg.API.MaxPageSize,
+		CollectorPolicies: map[string]eventstore.CollectorPolicy{"generic.one": {Kind: config.CollectorGenericJSON, HeartbeatPeriod: time.Minute}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	status := collectorStatusStub{statuses: []collectors.Status{{CollectorID: "generic.one", Kind: config.CollectorGenericJSON, Status: collectors.StatusHealthy}}}
+	return New(cfg, testLogger(t), version.Info{Version: "0.4.0-test"}, store, StorageFailure{}, status), store, cfg
 }
 
 func testConfig(t *testing.T) config.Config {

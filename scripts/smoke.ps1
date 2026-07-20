@@ -4,7 +4,7 @@ param()
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 $repoRoot = Split-Path -Parent $PSScriptRoot
-$temporaryRoot = Join-Path ([IO.Path]::GetTempPath()) ("exam-monitor m2-smoke-" + [guid]::NewGuid().ToString('N'))
+$temporaryRoot = Join-Path ([IO.Path]::GetTempPath()) ("exam-monitor m3-smoke-" + [guid]::NewGuid().ToString('N'))
 $buildDirectory = Join-Path $temporaryRoot 'bin'
 $configPath = Join-Path $temporaryRoot 'config.json'
 $dataDirectory = Join-Path $temporaryRoot 'data'
@@ -136,6 +136,13 @@ function Invoke-EventBatch {
     return Invoke-RestMethod -Uri "$BaseURL/api/v1/events/batch" -Method Post -ContentType 'application/json' -Body $body -TimeoutSec 3
 }
 
+function Invoke-HeartbeatBatch {
+    param([string]$BaseURL, [object[]]$Heartbeats)
+
+    $body = [ordered]@{ schema_version = 1; heartbeats = $Heartbeats } | ConvertTo-Json -Depth 10
+    return Invoke-RestMethod -Uri "$BaseURL/api/v1/collectors/heartbeats/batch" -Method Post -ContentType 'application/json' -Body $body -TimeoutSec 3
+}
+
 function Assert-CleanProcessStop {
     param([Diagnostics.Process]$MonitorProcess, [string]$StandardError)
 
@@ -190,6 +197,7 @@ try {
     $baseURL = "http://127.0.0.1:$port"
     $config = [ordered]@{
         schema_version = 1
+        runtime = [ordered]@{ mode = 'record-only'; backup_interface_enabled = $true }
         server = [ordered]@{
             listen_address = "127.0.0.1:$port"
             allow_non_loopback = $false
@@ -222,6 +230,45 @@ try {
             ffprobe_path = $ffprobePath
             ffprobe_timeout = '5s'
         }
+        collectors = @(
+            [ordered]@{
+                id = 'smoke.desktop'
+                kind = 'generic_json'
+                enabled = $true
+                heartbeat_period = '1m'
+                allowed_lateness = '1m'
+                offline_after = '5m'
+                planned_schedule = [ordered]@{
+                    timezone = 'UTC'
+                    windows = @([ordered]@{ days = @('monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday', 'sunday'); start_local = '00:00'; end_local = '24:00' })
+                }
+            },
+            [ordered]@{
+                id = 'smoke.ffmpeg'
+                kind = 'media'
+                enabled = $true
+                heartbeat_period = '5m'
+                allowed_lateness = '5m'
+                offline_after = '15m'
+                planned_schedule = [ordered]@{
+                    timezone = 'UTC'
+                    windows = @([ordered]@{ days = @('monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday', 'sunday'); start_local = '00:00'; end_local = '24:00' })
+                }
+            },
+            [ordered]@{
+                id = 'smoke.offline'
+                kind = 'generic_json'
+                enabled = $true
+                heartbeat_period = '1m'
+                allowed_lateness = '1m'
+                offline_after = '5m'
+                planned_schedule = [ordered]@{
+                    timezone = 'UTC'
+                    windows = @([ordered]@{ days = @('monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday', 'sunday'); start_local = '00:00'; end_local = '24:00' })
+                }
+            }
+        )
+        timeline = [ordered]@{ clock_uncertain_after = '1s'; max_query_range = '744h'; max_projection_facts = 100000 }
         logging = [ordered]@{ level = 'info' }
     }
     Write-Utf8WithoutBOM -Path $configPath -Contents ($config | ConvertTo-Json -Depth 6)
@@ -232,14 +279,14 @@ try {
     }
     $check = $checkJSON | ConvertFrom-Json
     $expectedDatabase = Join-Path $dataDirectory 'exam-monitor.db'
-    if ($check.status -ne 'ok' -or $check.data_directory -ne $dataDirectory -or $check.database_path -ne $expectedDatabase -or -not $check.media_ingest_enabled -or $check.media_inbox_directory -ne $mediaInbox -or $check.ffprobe_path -ne $ffprobePath) {
+    if ($check.status -ne 'ok' -or $check.data_directory -ne $dataDirectory -or $check.database_path -ne $expectedDatabase -or -not $check.media_ingest_enabled -or $check.media_inbox_directory -ne $mediaInbox -or $check.ffprobe_path -ne $ffprobePath -or $check.mode -ne 'record-only' -or $check.enabled_collectors -ne 3) {
         throw "unexpected --check-config output: $checkJSON"
     }
     if (Test-Path -LiteralPath $dataDirectory) {
         throw '--check-config created the runtime data directory'
     }
 
-    $process = Start-MonitorProcess -BinaryPath $binaryPath -ConfigurationPath $configPath -StandardOutput $firstStdout -StandardError $firstStderr -RunFor '10s'
+    $process = Start-MonitorProcess -BinaryPath $binaryPath -ConfigurationPath $configPath -StandardOutput $firstStdout -StandardError $firstStderr -RunFor '15s'
     [void](Wait-ForReadiness -MonitorProcess $process -BaseURL $baseURL)
 
     $event = [ordered]@{
@@ -257,6 +304,28 @@ try {
         throw "unexpected accepted response: $($accepted | ConvertTo-Json -Depth 6 -Compress)"
     }
     $eventID = $accepted.results[0].event_id
+
+    $evidenceAlias = Invoke-RestMethod -Uri "$baseURL/api/v1/evidence/batch" -Method Post -ContentType 'application/json' -Body ([ordered]@{ schema_version = 1; events = @($event) } | ConvertTo-Json -Depth 10) -TimeoutSec 3
+    if ($evidenceAlias.results[0].status -ne 'duplicate' -or $evidenceAlias.results[0].event_id -ne $eventID) {
+        throw "generic Evidence alias did not preserve M1 idempotency: $($evidenceAlias | ConvertTo-Json -Depth 6 -Compress)"
+    }
+
+    $heartbeat = [ordered]@{
+        schema_version = 1
+        collector_id = 'smoke.desktop'
+        state = 'idle'
+        device_start_raw = '2026-07-18T10:00:00+08:00'
+        device_end_raw = '2026-07-18T10:01:00+08:00'
+        clock_offset_ms = 0
+        clock_error_ms = 25
+        idempotency_key = 'm3-smoke-heartbeat-1'
+        quality_flags = @()
+    }
+    $heartbeatAccepted = Invoke-HeartbeatBatch -BaseURL $baseURL -Heartbeats @($heartbeat)
+    $heartbeatDuplicate = Invoke-HeartbeatBatch -BaseURL $baseURL -Heartbeats @($heartbeat)
+    if ($heartbeatAccepted.results[0].status -ne 'accepted' -or $heartbeatDuplicate.results[0].status -ne 'duplicate' -or $heartbeatAccepted.results[0].heartbeat_id -ne $heartbeatDuplicate.results[0].heartbeat_id) {
+        throw 'heartbeat append/replay did not preserve idempotency'
+    }
 
     $duplicate = Invoke-EventBatch -BaseURL $baseURL -Events @($event)
     if ($duplicate.results[0].status -ne 'duplicate' -or $duplicate.results[0].event_id -ne $eventID) {
@@ -307,6 +376,34 @@ try {
     }
     if ((Get-FileHash -LiteralPath $acceptedMediaPath -Algorithm SHA256).Hash.ToLowerInvariant() -ne $fixtureSHA256) {
         throw 'managed accepted media checksum does not match the sidecar'
+    }
+
+    $timelineStart = [Uri]::EscapeDataString('2026-07-18T00:00:00Z')
+    $timelineEnd = [Uri]::EscapeDataString('2026-07-20T23:59:00Z')
+    $timeline = Invoke-RestMethod -Uri "$baseURL/api/v1/timeline?start=$timelineStart&end=$timelineEnd&limit=100" -Method Get -TimeoutSec 5
+    $sourceTypes = @($timeline.entries | ForEach-Object { $_.source_type } | Sort-Object -Unique)
+    if ($timeline.schema_version -ne 1 -or $timeline.entries.Count -lt 3 -or -not ($sourceTypes -contains 'raw_event') -or -not ($sourceTypes -contains 'heartbeat') -or -not ($sourceTypes -contains 'media_segment')) {
+        throw "multi-source timeline is incomplete: $($timeline | ConvertTo-Json -Depth 8 -Compress)"
+    }
+    foreach ($entry in $timeline.entries) {
+        foreach ($field in @('stable_id', 'device_start_raw', 'device_start_utc', 'received_at_utc', 'corrected_start_utc', 'clock_error_ms', 'clock_uncertain')) {
+            if (-not $entry.PSObject.Properties[$field]) {
+                throw "timeline entry missing $field"
+            }
+        }
+    }
+
+    $coverageStart = [Uri]::EscapeDataString('2026-07-18T01:55:00Z')
+    $coverageEnd = [Uri]::EscapeDataString('2026-07-18T02:10:00Z')
+    $offlineCoverage = Invoke-RestMethod -Uri "$baseURL/api/v1/coverage?start=$coverageStart&end=$coverageEnd&collector_id=smoke.offline" -Method Get -TimeoutSec 5
+    $offlineIntervals = @($offlineCoverage.intervals)
+    if ($offlineCoverage.projections.Count -ne 1 -or $offlineCoverage.projections[0].status -ne 'fresh' -or -not ($offlineIntervals.availability -contains 'offline') -or ($offlineIntervals.availability -contains 'confirmed_idle')) {
+        throw "offline collector gap was not exposed accurately: $($offlineCoverage | ConvertTo-Json -Depth 8 -Compress)"
+    }
+    for ($index = 1; $index -lt $offlineIntervals.Count; $index++) {
+        if ($offlineIntervals[$index].start_utc -lt $offlineIntervals[$index - 1].end_utc) {
+            throw 'coverage projection contains overlapping intervals'
+        }
     }
 
     Remove-Item -LiteralPath $validConfirmationPath -Force
@@ -373,7 +470,7 @@ try {
     if (-not (Test-Path -LiteralPath $expectedDatabase -PathType Leaf)) {
         throw 'M2 smoke database was not created in the temporary data directory'
     }
-    Write-Output "M2 smoke passed: M1 event path plus media import, replay, quarantine, source preservation, and restart recovery ($baseURL)"
+    Write-Output "M3 smoke passed: M1/M2 recovery plus generic Evidence, append heartbeats, multi-source timeline, and explicit offline coverage ($baseURL)"
 }
 catch {
     foreach ($logPath in @($firstStderr, $secondStderr)) {

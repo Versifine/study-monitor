@@ -4,6 +4,8 @@
 
 ## 1. 数据源
 
+M3 已实现的 Recorder Core 接入边界只有：ActivityWatch 指定 bucket 的 GET-only 导入、版本化通用 JSON Evidence、版本化心跳和 M2 已完成媒体。以下条目描述允许保存的外部 Evidence；不代表 Recorder Core 在 M3 内实现对应原生采集器或分析。
+
 ### 电脑
 
 - 活动窗口
@@ -28,6 +30,8 @@
 - 解锁
 - 使用时间段
 - 健康数据同步
+
+Version 1 只接受外部工具经 `/api/v1/evidence/batch` 转换后的上述事实，不开发手机端或健康平台连接器。
 
 ### 未来可穿戴设备
 
@@ -57,7 +61,11 @@
 - 上传延迟
 - 分析积压
 
+M3 实际投影把可用性冻结为 `covered`、`confirmed_idle`、`pending`、`delayed`、`offline`、`unknown` 单值，把失焦/遮挡、损坏、时钟不确定和不完整作为独立质量标记。Version 1 只消费外部采集器的确定性质量上报；无心跳/AFK 事实不得推断为空闲。实现合同见 [`COLLECTORS_AND_TIMELINE.md`](COLLECTORS_AND_TIMELINE.md)。
+
 ## 4. 摄像头自检
+
+以下均为后续外部采集器或研究能力，M3 不实现视觉检测：
 
 - 清晰度
 - 对焦

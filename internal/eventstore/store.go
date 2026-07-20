@@ -24,16 +24,25 @@ type Options struct {
 	MaxEventBytes      int
 	MaxPayloadDepth    int
 	MaxPageSize        int
+	CollectorPolicies  map[string]CollectorPolicy
 	Now                func() time.Time
 }
 
+type CollectorPolicy struct {
+	Kind            string
+	HeartbeatPeriod time.Duration
+}
+
 type Store struct {
-	db              *sql.DB
-	maxBatchEvents  int
-	maxEventBytes   int
-	maxPayloadDepth int
-	maxPageSize     int
-	now             func() time.Time
+	db                         *sql.DB
+	maxBatchEvents             int
+	maxEventBytes              int
+	maxPayloadDepth            int
+	maxPageSize                int
+	maxTimelineProjectionBytes int
+	timelineSync               chan struct{}
+	collectorPolicies          map[string]CollectorPolicy
+	now                        func() time.Time
 }
 
 func Open(ctx context.Context, databasePath string, options Options) (*Store, error) {
@@ -74,13 +83,20 @@ func Open(ctx context.Context, databasePath string, options Options) (*Store, er
 		return closeOnError(err)
 	}
 
+	policies := make(map[string]CollectorPolicy, len(options.CollectorPolicies))
+	for id, policy := range options.CollectorPolicies {
+		policies[id] = policy
+	}
 	return &Store{
-		db:              db,
-		maxBatchEvents:  options.MaxBatchEvents,
-		maxEventBytes:   options.MaxEventBytes,
-		maxPayloadDepth: options.MaxPayloadDepth,
-		maxPageSize:     options.MaxPageSize,
-		now:             options.Now,
+		db:                         db,
+		maxBatchEvents:             options.MaxBatchEvents,
+		maxEventBytes:              options.MaxEventBytes,
+		maxPayloadDepth:            options.MaxPayloadDepth,
+		maxPageSize:                options.MaxPageSize,
+		maxTimelineProjectionBytes: 32 << 20,
+		timelineSync:               make(chan struct{}, 1),
+		collectorPolicies:          policies,
+		now:                        options.Now,
 	}, nil
 }
 

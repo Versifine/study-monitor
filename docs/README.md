@@ -5,8 +5,8 @@
 ## 当前状态
 
 - Version 1 设计审查已完成
-- M0 仓库与开发工具、M1 仅追加事件存储与本地 API、M2 外部媒体分段导入已完成
-- M3 尚未开始，必须作为后续独立任务执行
+- M0 仓库与开发工具、M1 仅追加事件存储与本地 API、M2 外部媒体分段导入、M3 采集器与统一时间线已完成
+- M4 尚未开始，必须作为后续独立任务执行
 - 时间不是当前最高风险；质量门槛优先于日历日期，M6 的 14 天认证不能压缩
 
 ## 三条阅读路径
@@ -38,8 +38,9 @@
 | [`V1_FREEZE_SPEC.md`](V1_FREEZE_SPEC.md) | Version 1 范围、模式和冻结完成线 |
 | [`ARCHITECTURE.md`](ARCHITECTURE.md) | 单体架构、模块边界和建议目录 |
 | [`DATA_MODEL.md`](DATA_MODEL.md) | 追加事实、投影、时间和版本规则 |
-| [`API.md`](API.md) | M1/M2 本地事件、健康和媒体状态接口合同 |
+| [`API.md`](API.md) | M1-M3 本地事件、健康、心跳、时间线和覆盖率接口合同 |
 | [`MEDIA_INGEST.md`](MEDIA_INGEST.md) | M2 外部媒体 sidecar、ready、受管存储、隔离和恢复合同 |
+| [`COLLECTORS_AND_TIMELINE.md`](COLLECTORS_AND_TIMELINE.md) | M3 ActivityWatch、通用 JSON、心跳、覆盖率与时间线合同 |
 | [`EVIDENCE_AND_INFERENCE.md`](EVIDENCE_AND_INFERENCE.md) | Evidence/Observation/Inference 分层边界 |
 | [`MILESTONES.md`](MILESTONES.md) | M0-M6 范围、排除项和验收标准 |
 
@@ -82,7 +83,7 @@
 
 ## 下一步
 
-1. 审查 M2 diff、测试、构建和 smoke 结果。
-2. 为 M2 创建独立 Git 检查点并停止。
-3. 只有在下一次明确任务中，才使用 `codex-prompts/04_M3.txt` 开始 M3。
-4. 不要提前进入 ActivityWatch 适配、覆盖率、前端、运维自动化或 AI。
+1. 审查 M3 diff、测试、构建和 smoke 结果。
+2. 为 M3 创建独立 Git 检查点并停止。
+3. 只有在下一次明确任务中，才使用 `codex-prompts/05_M4.txt` 开始 M4。
+4. 不要提前进入保留/磁盘保护、Windows 自动恢复、备份恢复、前端或 AI。

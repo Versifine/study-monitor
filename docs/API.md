@@ -1,6 +1,6 @@
-# M1-M2 本地 API
+# M1-M3 本地 API
 
-本文冻结 M1 的仅追加事件写入、查询和健康接口，以及 M2 的媒体入口状态接口。所有接口默认只监听 loopback；媒体数据面使用受管文件入口而不是 HTTP 上传。M2 不包含 ActivityWatch 适配、覆盖率、前端、AI 或复杂认证。
+本文冻结 M1 的仅追加事件写入/查询/健康接口、M2 的媒体入口状态，以及 M3 的通用 Evidence、心跳、采集器状态、覆盖率和统一时间线。所有接口默认只监听 loopback；媒体数据面使用受管文件入口而不是 HTTP 上传。M3 不包含前端、AI、原生手机/健康连接器或复杂认证。
 
 ## 1. 通用规则
 
@@ -100,7 +100,37 @@
 
 只接受 GET 和 HEAD；其他方法返回 405。
 
-## 6. 默认限制
+## 6. M3 通用 Evidence 与心跳
+
+`POST /api/v1/evidence/batch` 是 `/api/v1/events/batch` 的等价通用入口，复用第 2 节的完整 schema 和幂等/事务合同。两个路径写入同一事实表；手机和健康数据在 Version 1 只能由外部工具转换后走该合同。`runtime.mode=minimum` 时两个通用写入口均以 `API_MODULE_DISABLED` 关闭。
+
+`POST /api/v1/collectors/heartbeats/batch` 接受版本化 `heartbeats` 数组。每项保存稳定采集器、`active`/`idle`、原始设备开始/结束时间、设备 UTC、接收 UTC、校正时间、时钟偏移/误差、幂等键和冻结质量标记。区间不得超过配置心跳周期；未启用采集器、未知 offset、重复/未知字段和非法状态逐项拒绝。同键同内容返回原 `heartbeat_id`；同键不同内容返回冲突，事实不可修改或删除。`minimum` 模式下此外部入口同样关闭，内置 ActivityWatch/媒体路径不受影响。
+
+完整请求示例、错误边界和配置关系见 [`COLLECTORS_AND_TIMELINE.md`](COLLECTORS_AND_TIMELINE.md)。
+
+## 7. 采集器状态
+
+`GET|HEAD /api/v1/collectors/status`
+
+返回每个启用 ActivityWatch 适配器的 `healthy` 或 `unavailable`、稳定错误码、最近尝试/成功时间、断点和本进程导入/重复计数。状态接口 HTTP 200 不等于所有采集器健康；单个采集器失败不改变 `/health/ready`。
+
+## 8. 统一时间线
+
+`GET|HEAD /api/v1/timeline?start=<RFC3339>&end=<RFC3339>&limit=100&cursor=...`
+
+`start`/`end` 必须带已知 offset，范围不得超过 `timeline.max_query_range`。响应合并 `raw_event`、`heartbeat`、`media_segment`，返回 `stable_id`、原始设备时间、设备 UTC、接收 UTC、校正时间、时钟偏移/误差、`clock_uncertain`、质量标记和来源 payload。
+
+排序键是校正开始 UTC、接收 UTC、来源类型、来源 ID、投影 ID。首次响应同步投影并冻结 `snapshot_id`；不透明 cursor 绑定原查询范围和最后排序键，续页不再重建投影，后续新增事实不进入该分页快照。cursor 与不同范围混用必须拒绝。首屏/覆盖率投影共享单并发门，竞争请求返回 429；单次同步受 32 MiB 固定估算内存预算和 128 行写事务限制，超出事实或字节预算显式失败而不回滚 Evidence。
+
+## 9. 覆盖率
+
+`GET|HEAD /api/v1/coverage?start=<RFC3339>&end=<RFC3339>&collector_id=...`
+
+`collector_id` 可省略以重建所有启用采集器。每个计划启用时间返回不重叠的 `[start_utc,end_utc)`，可用性只能是 `covered`、`confirmed_idle`、`pending`、`delayed`、`offline`、`unknown`；质量标记是独立数组。只有明确 idle 心跳或 ActivityWatch AFK 事实可产生 `confirmed_idle`。
+
+`projections` 为每个采集器返回 `fresh`/`stale`、generation、事实水位和错误码。单个采集器重建失败不会阻止其他采集器；失败不删除事实。覆盖率预算只统计可形成区间的 ActivityWatch、心跳和媒体事实；通用 point Evidence 保留且仍可在统一时间线查询，但不消耗覆盖率事实预算。
+
+## 10. 默认限制
 
 | 配置 | 默认值 |
 |---|---:|
@@ -117,5 +147,8 @@
 | `media_ingest.max_segment_duration` | 10 分钟 |
 | `media_ingest.max_sidecar_bytes` | 64 KiB |
 | `media_ingest.max_scan_entries` | 1000 |
+| `timeline.clock_uncertain_after` | 1 秒 |
+| `timeline.max_query_range` | 744 小时 |
+| `timeline.max_projection_facts` | 100000 |
 
 生产数据库路径是 `<data_directory>/exam-monitor.db`。`--check-config` 只输出解析后的路径和配置摘要，不创建目录或数据库。

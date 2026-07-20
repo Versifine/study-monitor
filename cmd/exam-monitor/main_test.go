@@ -8,9 +8,25 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/Versifine/study-monitor/internal/config"
 )
+
+func TestBinaryEmbedsIANAZoneData(t *testing.T) {
+	// A frozen Windows deployment must not depend on a Go installation's
+	// GOROOT/lib/time/zoneinfo.zip or an operator-provided ZONEINFO file.
+	t.Setenv("GOROOT", t.TempDir())
+	t.Setenv("ZONEINFO", filepath.Join(t.TempDir(), "missing-zoneinfo.zip"))
+	location, err := time.LoadLocation("Asia/Shanghai")
+	if err != nil {
+		t.Fatalf("load embedded IANA timezone: %v", err)
+	}
+	_, offset := time.Date(2026, 7, 20, 0, 0, 0, 0, time.UTC).In(location).Zone()
+	if offset != 8*60*60 {
+		t.Fatalf("Asia/Shanghai offset=%d", offset)
+	}
+}
 
 func TestRunVersionIncludesRequiredFields(t *testing.T) {
 	var stdout, stderr bytes.Buffer

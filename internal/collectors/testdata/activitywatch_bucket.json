@@ -1,0 +1,6 @@
+{
+  "id": "aw-watcher-afk_test-host",
+  "type": "afkstatus",
+  "client": "aw-watcher-afk",
+  "hostname": "test-host"
+}
