@@ -41,6 +41,7 @@ type options struct {
 	backupDatabase        string
 	verifyDatabase        string
 	mediaManifestDatabase string
+	certificationDatabase string
 	schemaInfo            bool
 }
 
@@ -107,6 +108,17 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer, lookup co
 			result.Media = []eventstore.MediaManifestEntry{}
 		}
 		if err := writeJSON(stdout, result); err != nil {
+			return exitRuntime
+		}
+		return exitOK
+	}
+	if opts.certificationDatabase != "" {
+		snapshot, snapshotErr := eventstore.ReadCertificationDatabaseSnapshot(ctx, opts.certificationDatabase)
+		if snapshotErr != nil {
+			logger.Error("certification", "database_snapshot_failed", eventstore.ErrorCode(snapshotErr), "read certification database snapshot", snapshotErr)
+			return exitRuntime
+		}
+		if err := writeJSON(stdout, snapshot); err != nil {
 			return exitRuntime
 		}
 		return exitOK
@@ -233,6 +245,7 @@ func parseOptions(args []string) (options, error) {
 	flags.StringVar(&opts.backupDatabase, "backup-database", "", "create a consistent verified database snapshot and exit")
 	flags.StringVar(&opts.verifyDatabase, "verify-database", "", "verify a database snapshot and exit")
 	flags.StringVar(&opts.mediaManifestDatabase, "media-manifest-database", "", "read accepted media manifest from a verified database snapshot and exit")
+	flags.StringVar(&opts.certificationDatabase, "certification-snapshot-database", "", "read M6 aggregate metrics from a verified database snapshot and exit")
 	flags.BoolVar(&opts.schemaInfo, "schema-info", false, "print database schema compatibility and exit")
 	if err := flags.Parse(args); err != nil {
 		return options{}, &cliError{code: codeCLIInvalid, err: err}
@@ -248,6 +261,9 @@ func parseOptions(args []string) (options, error) {
 		actions++
 	}
 	if opts.mediaManifestDatabase != "" {
+		actions++
+	}
+	if opts.certificationDatabase != "" {
 		actions++
 	}
 	if actions > 1 {
@@ -289,7 +305,7 @@ func countTrue(values ...bool) int {
 }
 
 func writeUsage(output io.Writer) {
-	_, _ = fmt.Fprintln(output, "Usage: exam-monitor [--config path] [--check-config|--version|--schema-info|--backup-database path|--verify-database path|--media-manifest-database path|--help] [--run-for duration]")
+	_, _ = fmt.Fprintln(output, "Usage: exam-monitor [--config path] [--check-config|--version|--schema-info|--backup-database path|--verify-database path|--media-manifest-database path|--certification-snapshot-database path|--help] [--run-for duration]")
 }
 
 func openMaintenanceStore(ctx context.Context, cfg config.Config) (*eventstore.Store, error) {

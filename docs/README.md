@@ -7,6 +7,7 @@
 - Version 1 设计审查已完成
 - M0 仓库与开发工具、M1 仅追加事件存储与本地 API、M2 外部媒体分段导入、M3 采集器与统一时间线、M4 恢复/保留/备份/回滚、M5 最小只读仪表盘已完成
 - M6 尚未开始，必须作为后续独立任务执行，14 天认证不得提前计时
+- M6 已具备冻结、采样、日报和最终硬门槛工具；真实 14 天仍须在核心来源与生产安装预检通过后开始
 - 时间不是当前最高风险；质量门槛优先于日历日期，M6 的 14 天认证不能压缩
 
 ## 三条阅读路径
@@ -55,6 +56,7 @@
 | [`OPERATIONS.md`](OPERATIONS.md) | 正常运行、维护、备份恢复与回滚 |
 | [`FAILURE_POLICY.md`](FAILURE_POLICY.md) | 故障级别与降级矩阵 |
 | [`STABILITY_AND_FREEZE.md`](STABILITY_AND_FREEZE.md) | M6 稳定性认证规则 |
+| [`M6_CERTIFICATION.md`](M6_CERTIFICATION.md) | M6 冻结、自动采样、日报、故障记录和最终判定执行手册 |
 | [`RISK_REGISTER.md`](RISK_REGISTER.md) | 当前风险、缓解和退出条件 |
 | [`DESIGN_REVIEW.md`](DESIGN_REVIEW.md) | 2026-07-18 审查记录，不是新需求来源 |
 

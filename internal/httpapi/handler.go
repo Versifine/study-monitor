@@ -191,7 +191,7 @@ func (fixedCollectorStatus) Status(context.Context) []collectors.Status { return
 type fixedOperationsStatus struct{ status operations.Status }
 
 func (provider fixedOperationsStatus) Status(context.Context) operations.Status {
-	return provider.status
+	return operations.WithRuntimeResources(provider.status)
 }
 
 func (handler *Handler) handleOperationsStatus(writer http.ResponseWriter, request *http.Request) {

@@ -1,0 +1,46 @@
+{
+  "schema_version": 1,
+  "utc_offset": "+08:00",
+  "sample_interval_minutes": 5,
+  "backup_rpo_hours": 24,
+  "media_sample_count": 3,
+  "limits": {
+    "max_cpu_percent": 25,
+    "max_working_set_bytes": 536870912,
+    "max_private_bytes": 536870912,
+    "max_handles": 1024,
+    "max_threads": 128,
+    "max_goroutines": 256,
+    "max_go_heap_bytes": 268435456,
+    "max_go_runtime_system_bytes": 536870912,
+    "max_wal_bytes": 67108864,
+    "max_staging_bytes": 2415919104,
+    "max_staging_files": 1000,
+    "max_log_bytes": 52428800,
+    "max_data_bytes": 53687091200,
+    "max_backup_bytes": 107374182400,
+    "max_media_ready_backlog": 10,
+    "min_free_bytes": 1073741824
+  },
+  "recovery_rto_seconds": {
+    "core_process": 90,
+    "system_reboot": 180,
+    "activitywatch": 300,
+    "media": 900,
+    "backup_restore": 1800,
+    "rollback": 180
+  },
+  "planned_exercises": [
+    { "id": "day02-network", "kind": "network_disconnect", "rto_key": "activitywatch", "relative_day": 2, "start_local": "18:00", "duration_minutes": 15 },
+    { "id": "day03-process", "kind": "process_termination", "rto_key": "core_process", "relative_day": 3, "start_local": "18:00", "duration_minutes": 15 },
+    { "id": "day04-write", "kind": "write_interruption", "rto_key": "core_process", "relative_day": 4, "start_local": "18:00", "duration_minutes": 15 },
+    { "id": "day05-duplicate", "kind": "duplicate_submission", "rto_key": "core_process", "relative_day": 5, "start_local": "18:00", "duration_minutes": 15 },
+    { "id": "day06-corrupt", "kind": "corrupt_media", "rto_key": "media", "relative_day": 6, "start_local": "18:00", "duration_minutes": 15 },
+    { "id": "day07-disk", "kind": "low_disk", "rto_key": "core_process", "relative_day": 7, "start_local": "18:00", "duration_minutes": 15 },
+    { "id": "day08-cloud", "kind": "cloud_unavailable", "rto_key": "core_process", "relative_day": 8, "start_local": "18:00", "duration_minutes": 15 },
+    { "id": "day09-clock", "kind": "clock_offset", "rto_key": "activitywatch", "relative_day": 9, "start_local": "18:00", "duration_minutes": 15 },
+    { "id": "day10-backup", "kind": "backup_restore", "rto_key": "backup_restore", "relative_day": 10, "start_local": "18:00", "duration_minutes": 30 },
+    { "id": "day11-rollback", "kind": "rollback", "rto_key": "rollback", "relative_day": 11, "start_local": "18:00", "duration_minutes": 30 },
+    { "id": "day12-reboot", "kind": "system_reboot", "rto_key": "system_reboot", "relative_day": 12, "start_local": "18:00", "duration_minutes": 30 }
+  ]
+}

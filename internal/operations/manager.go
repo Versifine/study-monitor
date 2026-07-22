@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"strings"
 	"sync"
 	"time"
@@ -47,12 +48,21 @@ type Repository interface {
 }
 
 type Status struct {
-	SchemaVersion int    `json:"schema_version"`
-	DiskLevel     string `json:"disk_level"`
-	FreeBytes     uint64 `json:"free_bytes"`
-	ErrorCode     string `json:"error_code,omitempty"`
-	CheckedAtUTC  string `json:"checked_at_utc,omitempty"`
-	Retention     string `json:"retention"`
+	SchemaVersion int              `json:"schema_version"`
+	DiskLevel     string           `json:"disk_level"`
+	FreeBytes     uint64           `json:"free_bytes"`
+	ErrorCode     string           `json:"error_code,omitempty"`
+	CheckedAtUTC  string           `json:"checked_at_utc,omitempty"`
+	Retention     string           `json:"retention"`
+	Runtime       RuntimeResources `json:"runtime"`
+}
+
+type RuntimeResources struct {
+	Goroutines         int    `json:"goroutines"`
+	HeapAllocBytes     uint64 `json:"heap_alloc_bytes"`
+	HeapInUseBytes     uint64 `json:"heap_in_use_bytes"`
+	StackInUseBytes    uint64 `json:"stack_in_use_bytes"`
+	RuntimeSystemBytes uint64 `json:"runtime_system_bytes"`
 }
 
 type Manager struct {
@@ -82,8 +92,24 @@ func NewWithProbe(cfg config.Config, repository Repository, logger *logging.Logg
 
 func (manager *Manager) Status(context.Context) Status {
 	manager.mu.RLock()
-	defer manager.mu.RUnlock()
-	return manager.status
+	status := manager.status
+	manager.mu.RUnlock()
+	return WithRuntimeResources(status)
+}
+
+// WithRuntimeResources adds bounded, read-only runtime counters required by
+// the M6 stability certification. It does not affect readiness or write gates.
+func WithRuntimeResources(status Status) Status {
+	var memory runtime.MemStats
+	runtime.ReadMemStats(&memory)
+	status.Runtime = RuntimeResources{
+		Goroutines:         runtime.NumGoroutine(),
+		HeapAllocBytes:     memory.HeapAlloc,
+		HeapInUseBytes:     memory.HeapInuse,
+		StackInUseBytes:    memory.StackInuse,
+		RuntimeSystemBytes: memory.Sys,
+	}
+	return status
 }
 
 func (manager *Manager) MediaAllowed() (bool, string) {

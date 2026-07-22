@@ -1,5 +1,5 @@
 [CmdletBinding()]
-param([switch]$SkipOperationalSmoke)
+param([switch]$SkipOperationalSmoke, [string]$BinaryPath)
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
@@ -16,7 +16,10 @@ try {
     if ($LASTEXITCODE -ne 0) { throw 'FAULT_INJECTION_NETWORK_FAILED' }
     & go test -mod=vendor -count=1 ./internal/operations -run 'TestInjectedDiskLevelsProtectMediaBeforeCoreWrites|TestRetentionDefaultsOffAndRequiresVerifiedFullBackup|TestRetentionRecoversDeleteBeforeDatabaseCommit|TestTemporaryCleanupOnlyRemovesOldUnreferencedCorePartial'
     if ($LASTEXITCODE -ne 0) { throw 'FAULT_INJECTION_STORAGE_FAILED' }
-    if (-not $SkipOperationalSmoke) { & (Join-Path $PSScriptRoot 'smoke.ps1') }
+    if (-not $SkipOperationalSmoke) {
+        if ($BinaryPath) { & (Join-Path $PSScriptRoot 'smoke.ps1') -BinaryPath $BinaryPath }
+        else { & (Join-Path $PSScriptRoot 'smoke.ps1') }
+    }
     Write-Output 'M4 fault injection passed: busy/read-only database, network isolation, injected disk levels, safe retention/temp recovery, plus process/backup/restore/corruption/rollback scenarios in operational smoke'
 }
 finally {

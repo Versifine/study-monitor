@@ -112,6 +112,17 @@ func TestRunRejectsConflictingActions(t *testing.T) {
 	}
 }
 
+func TestParseCertificationSnapshotAction(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "snapshot.db")
+	opts, err := parseOptions([]string{"--certification-snapshot-database", path})
+	if err != nil || opts.certificationDatabase != path {
+		t.Fatalf("parse certification action = %#v, %v", opts, err)
+	}
+	if _, err := parseOptions([]string{"--certification-snapshot-database", path, "--schema-info"}); cliErrorCode(err) != codeCLIConflict {
+		t.Fatalf("conflicting certification action error = %v", err)
+	}
+}
+
 func TestRunRejectsInvalidRunFor(t *testing.T) {
 	var stdout, stderr bytes.Buffer
 	code := run(context.Background(), []string{"--run-for=6m"}, &stdout, &stderr, emptyEnvironment)

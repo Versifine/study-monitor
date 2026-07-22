@@ -1,5 +1,5 @@
 [CmdletBinding()]
-param()
+param([string]$BinaryPath)
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
@@ -188,9 +188,17 @@ try {
     Write-MediaSidecar -Path $validSidecarPath -SizeBytes $fixtureBytes.Length -SHA256 $fixtureSHA256 -SourceKey 'm2-smoke-valid-1'
     [IO.File]::WriteAllBytes($validReadyPath, [byte[]]@())
 
-    $binaryPath = ((& (Join-Path $PSScriptRoot 'build.ps1') -OutputDirectory $buildDirectory) | Select-Object -Last 1)
-    if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $binaryPath -PathType Leaf)) {
-        throw 'smoke build did not produce exam-monitor.exe'
+    if ($BinaryPath) {
+        if (-not [IO.Path]::IsPathRooted($BinaryPath) -or -not (Test-Path -LiteralPath $BinaryPath -PathType Leaf)) {
+            throw 'smoke candidate binary is invalid'
+        }
+        $binaryPath = [IO.Path]::GetFullPath($BinaryPath)
+    }
+    else {
+        $binaryPath = ((& (Join-Path $PSScriptRoot 'build.ps1') -OutputDirectory $buildDirectory) | Select-Object -Last 1)
+        if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $binaryPath -PathType Leaf)) {
+            throw 'smoke build did not produce exam-monitor.exe'
+        }
     }
 
     $port = Get-FreeLoopbackPort

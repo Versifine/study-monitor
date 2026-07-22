@@ -137,7 +137,7 @@ M4 数据库保留空间受威胁时，即使 SQLite 仍可探测为可写，`/h
 
 `GET|HEAD /api/v1/operations/status`
 
-返回 `schema_version=1`、`disk_level`（`normal|warning|critical|reserve`；存储初始化失败时为 `unavailable`）、`free_bytes`、最近 `checked_at_utc`、可选稳定 `error_code` 和 `retention`（默认 `disabled`）。该端点是只读状态，不提供改变水位、启用删除、执行备份或回滚的 HTTP 操作；高风险运维只能走本机 PowerShell 脚本。存储打开失败时不会以 `normal/free_bytes=0` 假报健康。
+返回 `schema_version=1`、`disk_level`（`normal|warning|critical|reserve`；存储初始化失败时为 `unavailable`）、`free_bytes`、最近 `checked_at_utc`、可选稳定 `error_code`、`retention`（默认 `disabled`），以及 M6 只读资源快照 `runtime`：Go 协程数、堆分配/占用、栈占用和 Go runtime 向系统申请的字节数。资源字段只供稳定性采样，不参与 readiness，也不创建监控队列。该端点不提供改变水位、启用删除、执行备份或回滚的 HTTP 操作；高风险运维只能走本机 PowerShell 脚本。存储打开失败时不会以 `normal/free_bytes=0` 假报健康。
 
 ## 11. M5 仪表盘与汇总
 

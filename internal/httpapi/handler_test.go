@@ -264,7 +264,8 @@ func TestReadinessReportsWritableAndInitializationFailure(t *testing.T) {
 	failed.ServeHTTP(operationsResponse, httptest.NewRequest(http.MethodGet, "/api/v1/operations/status", nil))
 	var operationsBody map[string]any
 	decodeResponse(t, operationsResponse, &operationsBody)
-	if operationsBody["disk_level"] != "unavailable" || operationsBody["error_code"] != eventstore.CodeMigrationUnsupported {
+	runtimeBody, runtimeOK := operationsBody["runtime"].(map[string]any)
+	if operationsBody["disk_level"] != "unavailable" || operationsBody["error_code"] != eventstore.CodeMigrationUnsupported || !runtimeOK || runtimeBody["goroutines"].(float64) < 1 {
 		t.Fatalf("failed storage operations status=%#v", operationsBody)
 	}
 }

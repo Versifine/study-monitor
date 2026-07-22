@@ -118,7 +118,7 @@ if ($env:GOPROXY -ne $beforeProxy) { throw 'dev.ps1 did not restore GOPROXY' }
 func TestOperationalScriptsParseAsPowerShell(t *testing.T) {
 	requireOuterWindowsTest(t)
 	repository := repositoryRoot(t)
-	names := []string{"build-web.ps1", "process-control.ps1", "install.ps1", "uninstall.ps1", "run-supervised.ps1", "backup.ps1", "restore.ps1", "rollback.ps1", "smoke-m4.ps1", "fault-injection.ps1"}
+	names := []string{"build-web.ps1", "process-control.ps1", "install.ps1", "uninstall.ps1", "run-supervised.ps1", "backup.ps1", "restore.ps1", "rollback.ps1", "smoke-m4.ps1", "fault-injection.ps1", "m6-certification.ps1"}
 	quoted := make([]string, len(names))
 	for index, name := range names {
 		quoted[index] = "'" + quotePowerShell(filepath.Join(repository, "scripts", name)) + "'"
@@ -135,6 +135,116 @@ foreach ($path in @(%s)) {
 if ($failed.Count -ne 0) { throw ($failed -join [Environment]::NewLine) }
 `, strings.Join(quoted, ",")))
 	runPowerShell(t, wrapper, nil)
+}
+
+func TestM6CertificationProfileDeclaresEveryRequiredExerciseOnce(t *testing.T) {
+	repository := repositoryRoot(t)
+	raw, err := os.ReadFile(filepath.Join(repository, "configs", "m6-certification.example.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var profile struct {
+		SchemaVersion         int                `json:"schema_version"`
+		SampleIntervalMinutes int                `json:"sample_interval_minutes"`
+		BackupRPOHours        int                `json:"backup_rpo_hours"`
+		Limits                map[string]float64 `json:"limits"`
+		RecoveryRTOSeconds    map[string]int     `json:"recovery_rto_seconds"`
+		PlannedExercises      []struct {
+			Kind   string `json:"kind"`
+			RTOKey string `json:"rto_key"`
+		} `json:"planned_exercises"`
+	}
+	if err := json.Unmarshal(raw, &profile); err != nil {
+		t.Fatal(err)
+	}
+	if profile.SchemaVersion != 1 || profile.SampleIntervalMinutes != 5 || profile.BackupRPOHours != 24 {
+		t.Fatalf("invalid M6 profile header: %#v", profile)
+	}
+	for _, name := range []string{"max_cpu_percent", "max_working_set_bytes", "max_private_bytes", "max_handles", "max_threads", "max_goroutines", "max_go_heap_bytes", "max_go_runtime_system_bytes", "max_wal_bytes", "max_staging_bytes", "max_staging_files", "max_log_bytes", "max_data_bytes", "max_backup_bytes", "max_media_ready_backlog", "min_free_bytes"} {
+		if profile.Limits[name] <= 0 {
+			t.Fatalf("missing or invalid M6 limit %q", name)
+		}
+	}
+	for _, name := range []string{"core_process", "system_reboot", "activitywatch", "media", "backup_restore", "rollback"} {
+		if profile.RecoveryRTOSeconds[name] <= 0 {
+			t.Fatalf("missing or invalid M6 RTO %q", name)
+		}
+	}
+	counts := map[string]int{}
+	for _, exercise := range profile.PlannedExercises {
+		counts[exercise.Kind]++
+		if profile.RecoveryRTOSeconds[exercise.RTOKey] <= 0 {
+			t.Fatalf("M6 exercise %q has invalid RTO key %q", exercise.Kind, exercise.RTOKey)
+		}
+	}
+	for _, name := range []string{"network_disconnect", "process_termination", "system_reboot", "write_interruption", "duplicate_submission", "corrupt_media", "low_disk", "cloud_unavailable", "clock_offset", "backup_restore", "rollback"} {
+		if counts[name] != 1 {
+			t.Fatalf("M6 exercise %q count=%d", name, counts[name])
+		}
+	}
+}
+
+func TestM6CoverageGateUsesIndependentScheduleAndStrictMediaUsability(t *testing.T) {
+	requireOuterWindowsTest(t)
+	repository := repositoryRoot(t)
+	script := filepath.Join(repository, "scripts", "m6-certification.ps1")
+	wrapper := fmt.Sprintf(`
+. '%s'
+$coverage = @'
+{
+  "intervals": [
+    {"collector_id":"aw","start_utc":"2026-07-20T00:00:00Z","end_utc":"2026-07-20T00:10:00Z","availability":"offline","quality_flags":[]},
+    {"collector_id":"media","start_utc":"2026-07-20T12:00:00Z","end_utc":"2026-07-20T12:05:00Z","availability":"covered","quality_flags":[]},
+    {"collector_id":"media","start_utc":"2026-07-20T12:05:00Z","end_utc":"2026-07-20T12:10:00Z","availability":"confirmed_idle","quality_flags":[]}
+  ],
+  "projections": [
+    {"collector_id":"aw","status":"fresh"},
+    {"collector_id":"media","status":"fresh"}
+  ]
+}
+'@ | ConvertFrom-Json
+$collectors = @'
+[
+  {"id":"aw","kind":"activitywatch","planned_schedule":{"timezone":"Asia/Shanghai","windows":[{"days":["monday"],"start_local":"08:00","end_local":"08:10"}]}},
+  {"id":"media","kind":"media","planned_schedule":{"timezone":"Asia/Shanghai","windows":[{"days":["monday"],"start_local":"20:00","end_local":"20:10"}]}}
+]
+'@ | ConvertFrom-Json
+$excluded = @([pscustomobject]@{ start_utc = '2026-07-20T00:04:00Z'; end_utc = '2026-07-20T00:06:00Z' })
+$result = @(Measure-Coverage -Coverage $coverage -Collectors $collectors -Excluded $excluded -DayStartUTC ([datetime]'2026-07-19T16:00:00Z'))
+if ($result.Count -ne 2) { throw 'unexpected result count' }
+$aw = $result | Where-Object collector_id -eq 'aw'
+$media = $result | Where-Object collector_id -eq 'media'
+if (-not $aw.classification_passed -or $aw.maximum_unexpected_offline_unknown_seconds -ne 240) { throw ('AW gate mismatch: ' + ($aw | ConvertTo-Json -Compress)) }
+if (-not $media.classification_passed -or [math]::Abs([double]$media.usable_ratio - 0.5) -gt 0.0001) { throw ('media gate mismatch: ' + ($media | ConvertTo-Json -Compress)) }
+`, quotePowerShell(script))
+	runPowerShell(t, writePowerShellWrapper(t, wrapper), nil)
+}
+
+func TestM6ExerciseRecordCannotClaimPassedBeyondFrozenRTO(t *testing.T) {
+	requireOuterWindowsTest(t)
+	repository := repositoryRoot(t)
+	script := filepath.Join(repository, "scripts", "m6-certification.ps1")
+	records := t.TempDir()
+	wrapper := fmt.Sprintf(`
+. '%s'
+function Assert-FrozenInputs { param($Manifest) }
+$now = [DateTime]::UtcNow
+$manifest = [pscustomobject]@{
+  paths = [pscustomobject]@{ certification_directory = '%s' }
+  planned_exercises = @([pscustomobject]@{
+    id = 'day03-process'; kind = 'process_termination'; rto_key = 'core_process'; rto_seconds = 90
+    start_utc = $now.AddMinutes(-1).ToString('o'); end_utc = $now.AddMinutes(1).ToString('o')
+  })
+}
+$RecordKind = 'process_termination'
+$RecordStatus = 'passed'
+$RecordDetail = 'measured recovery exceeded RTO'
+$RecordDurationSeconds = 91
+$record = Invoke-Record -Manifest $manifest
+if ($record.status -ne 'failed' -or $record.error_code -ne 'M6_EXERCISE_RTO_MISSED') { throw ('RTO claim accepted: ' + ($record | ConvertTo-Json -Compress)) }
+if (-not (Test-Path -LiteralPath (Join-Path '%s' 'violations.jsonl'))) { throw 'RTO violation missing' }
+`, quotePowerShell(script), quotePowerShell(records), quotePowerShell(records))
+	runPowerShell(t, writePowerShellWrapper(t, wrapper), nil)
 }
 
 func TestProcessControlIgnoresStaleSupervisorIdentity(t *testing.T) {

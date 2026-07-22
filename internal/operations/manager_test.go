@@ -133,6 +133,13 @@ func TestInjectedDiskLevelsProtectMediaBeforeCoreWrites(t *testing.T) {
 	}
 }
 
+func TestStatusIncludesBoundedRuntimeCertificationCounters(t *testing.T) {
+	status := WithRuntimeResources(Status{SchemaVersion: 1, DiskLevel: DiskNormal, Retention: "disabled"})
+	if status.Runtime.Goroutines < 1 || status.Runtime.HeapAllocBytes == 0 || status.Runtime.HeapInUseBytes == 0 || status.Runtime.StackInUseBytes == 0 || status.Runtime.RuntimeSystemBytes == 0 {
+		t.Fatalf("runtime resources = %#v", status.Runtime)
+	}
+}
+
 func TestCoreGateRefreshesRealProbeInsteadOfReusingPeriodicCache(t *testing.T) {
 	cfg := testConfig(t)
 	repository := &fakeRepository{}
