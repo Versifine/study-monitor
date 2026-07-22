@@ -146,7 +146,7 @@ function Invoke-HeartbeatBatch {
 function Assert-CleanProcessStop {
     param([Diagnostics.Process]$MonitorProcess, [string]$StandardError)
 
-    if (-not $MonitorProcess.WaitForExit(15000)) {
+    if (-not $MonitorProcess.WaitForExit(35000)) {
         throw 'exam-monitor did not exit within the smoke timeout'
     }
     $records = @()
@@ -279,15 +279,38 @@ try {
     }
     $check = $checkJSON | ConvertFrom-Json
     $expectedDatabase = Join-Path $dataDirectory 'exam-monitor.db'
-    if ($check.status -ne 'ok' -or $check.data_directory -ne $dataDirectory -or $check.database_path -ne $expectedDatabase -or -not $check.media_ingest_enabled -or $check.media_inbox_directory -ne $mediaInbox -or $check.ffprobe_path -ne $ffprobePath -or $check.mode -ne 'record-only' -or $check.enabled_collectors -ne 3) {
+    if ($check.status -ne 'ok' -or $check.data_directory -ne $dataDirectory -or $check.database_path -ne $expectedDatabase -or -not $check.media_ingest_enabled -or -not $check.dashboard_enabled -or $check.media_inbox_directory -ne $mediaInbox -or $check.ffprobe_path -ne $ffprobePath -or $check.mode -ne 'record-only' -or $check.enabled_collectors -ne 3) {
         throw "unexpected --check-config output: $checkJSON"
     }
     if (Test-Path -LiteralPath $dataDirectory) {
         throw '--check-config created the runtime data directory'
     }
 
-    $process = Start-MonitorProcess -BinaryPath $binaryPath -ConfigurationPath $configPath -StandardOutput $firstStdout -StandardError $firstStderr -RunFor '15s'
+    $process = Start-MonitorProcess -BinaryPath $binaryPath -ConfigurationPath $configPath -StandardOutput $firstStdout -StandardError $firstStderr -RunFor '25s'
     [void](Wait-ForReadiness -MonitorProcess $process -BaseURL $baseURL)
+
+    $dashboardPage = Invoke-WebRequest -UseBasicParsing -Uri "$baseURL/" -Method Get -TimeoutSec 3
+    foreach ($panel in @('storage', 'collectors', 'backlog', 'coverage', 'timeline', 'faults')) {
+        if ($dashboardPage.Content -notmatch ('data-panel="' + $panel + '"')) {
+            throw "embedded dashboard is missing the $panel panel"
+        }
+    }
+    if ($dashboardPage.Content -match '(?i)<form') {
+        throw 'read-only dashboard unexpectedly contains a form'
+    }
+    $dashboardAsset = Invoke-WebRequest -UseBasicParsing -Uri "$baseURL/assets/app.js" -Method Get -TimeoutSec 3
+    if ($dashboardAsset.Content -notmatch '/api/v1/dashboard/summary' -or $dashboardAsset.Content -match '(?i)method:\s*["'']POST') {
+        throw 'embedded dashboard asset does not preserve the GET-only summary contract'
+    }
+    $dashboardSummary = Invoke-RestMethod -Uri "$baseURL/api/v1/dashboard/summary" -Method Get -TimeoutSec 3
+    if ($dashboardSummary.schema_version -ne 1 -or $dashboardSummary.runtime_mode -ne 'record-only' -or $dashboardSummary.analysis.status -ne 'not_installed' -or $null -ne $dashboardSummary.analysis.backlog -or $dashboardSummary.external_backlogs.Count -ne 3) {
+        throw "dashboard absence/backlog contract is inaccurate: $($dashboardSummary | ConvertTo-Json -Depth 8 -Compress)"
+    }
+    foreach ($backlog in $dashboardSummary.external_backlogs) {
+        if ($backlog.status -ne 'unknown' -or $null -ne $backlog.items -or $null -ne $backlog.bytes) {
+            throw "unreported external backlog became a confirmed zero: $($backlog | ConvertTo-Json -Compress)"
+        }
+    }
 
     $event = [ordered]@{
         schema_version = 1
@@ -358,7 +381,8 @@ try {
             $status.ffprobe_version -eq $expectedFFprobeVersion -and
             $status.ingest.accepted -eq 1 -and
             $status.ingest.total_segments -eq 1 -and
-            $status.ingest.backlog -eq 0
+            $status.ingest.backlog -eq 0 -and
+            (Test-Path -LiteralPath $validConfirmationPath -PathType Leaf)
     }
     if (-not (Test-Path -LiteralPath $validConfirmationPath -PathType Leaf)) {
         throw 'accepted media confirmation marker was not created'
@@ -406,6 +430,11 @@ try {
         }
     }
 
+    $populatedDashboard = Invoke-RestMethod -Uri "$baseURL/api/v1/dashboard/summary" -Method Get -TimeoutSec 3
+    if ($populatedDashboard.media.ingest.accepted -ne 1 -or $populatedDashboard.media.ingest.backlog -ne 0 -or $populatedDashboard.history.modules.Count -lt 6 -or $populatedDashboard.external_backlogs.Count -ne 3) {
+        throw "dashboard did not expose bounded Recorder Core state: $($populatedDashboard | ConvertTo-Json -Depth 8 -Compress)"
+    }
+
     Remove-Item -LiteralPath $validConfirmationPath -Force
     [void](Wait-ForMediaStatus -MonitorProcess $process -BaseURL $baseURL -Description 'idempotent confirmation replay' -Predicate {
         param($status)
@@ -444,7 +473,7 @@ try {
     Assert-CleanProcessStop -MonitorProcess $process -StandardError $firstStderr
     $process = $null
 
-    $process = Start-MonitorProcess -BinaryPath $binaryPath -ConfigurationPath $configPath -StandardOutput $secondStdout -StandardError $secondStderr -RunFor '8s'
+    $process = Start-MonitorProcess -BinaryPath $binaryPath -ConfigurationPath $configPath -StandardOutput $secondStdout -StandardError $secondStderr -RunFor '12s'
     [void](Wait-ForReadiness -MonitorProcess $process -BaseURL $baseURL)
     $restartQuery = Invoke-RestMethod -Uri "$baseURL/api/v1/events?limit=10" -Method Get -TimeoutSec 3
     if ($restartQuery.events.Count -ne 1 -or $restartQuery.events[0].id -ne $eventID -or $restartQuery.events[0].idempotency_key -ne 'm1-smoke-event-1') {
@@ -471,7 +500,7 @@ try {
         throw 'M2 smoke database was not created in the temporary data directory'
     }
     & (Join-Path $PSScriptRoot 'smoke-m4.ps1') -BinaryPath $binaryPath -SourceConfigPath $configPath -SourceDataDirectory $dataDirectory
-    Write-Output "M4 smoke passed over M1-M3 compatibility: generic Evidence, media recovery, append heartbeats, unified timeline, explicit coverage, and frozen operations ($baseURL)"
+    Write-Output "M5 smoke passed over M1-M4 compatibility: embedded read-only dashboard, explicit unknown/zero states, generic Evidence, media recovery, unified timeline, coverage, and frozen operations ($baseURL)"
 }
 catch {
     foreach ($logPath in @($firstStderr, $secondStderr)) {

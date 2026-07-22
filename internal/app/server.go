@@ -10,12 +10,14 @@ import (
 
 	"github.com/Versifine/study-monitor/internal/collectors"
 	"github.com/Versifine/study-monitor/internal/config"
+	"github.com/Versifine/study-monitor/internal/dashboard"
 	"github.com/Versifine/study-monitor/internal/eventstore"
 	"github.com/Versifine/study-monitor/internal/httpapi"
 	"github.com/Versifine/study-monitor/internal/logging"
 	"github.com/Versifine/study-monitor/internal/mediaingest"
 	"github.com/Versifine/study-monitor/internal/operations"
 	"github.com/Versifine/study-monitor/internal/version"
+	webassets "github.com/Versifine/study-monitor/web"
 )
 
 const (
@@ -66,6 +68,14 @@ func Run(ctx context.Context, cfg config.Config, logger *logging.Logger, build v
 	}
 	defer listener.Close()
 
+	var dashboardHandler *dashboard.Handler
+	if cfg.DashboardIsEnabled() {
+		dashboardHandler, err = dashboard.New(webassets.Dist)
+		if err != nil {
+			logger.Error("dashboard", "initialization_failed", "DASHBOARD_ASSETS_INVALID", "embedded dashboard is unavailable; recorder core will continue", err)
+		}
+	}
+
 	collectorPolicies := make(map[string]eventstore.CollectorPolicy)
 	for _, collector := range cfg.Collectors {
 		if collector.Enabled {
@@ -91,7 +101,17 @@ func Run(ctx context.Context, cfg config.Config, logger *logging.Logger, build v
 		operationsManager = operations.New(cfg, store, logger)
 		operationsManager.Initialize(ctx)
 		operationsManager.RecordRuntimeMode(ctx, cfg.Runtime.Mode, "current-user", "startup_config", "CONFIG_MODE")
-		operationsManager.RecordModuleState(ctx, "dashboard", "disabled", "DASHBOARD_NOT_INSTALLED")
+		dashboardState, dashboardReason := "disabled", "CONFIG_DISABLED"
+		if cfg.Runtime.Mode == config.ModeMinimum {
+			dashboardReason = "MINIMUM_MODE"
+		} else if cfg.DashboardIsEnabled() {
+			if dashboardHandler != nil {
+				dashboardState, dashboardReason = "healthy", "EMBEDDED_ASSETS_READY"
+			} else {
+				dashboardState, dashboardReason = "unavailable", "DASHBOARD_ASSETS_INVALID"
+			}
+		}
+		operationsManager.RecordModuleState(ctx, "dashboard", dashboardState, dashboardReason)
 		operationsManager.RecordModuleState(ctx, "coverage", "healthy", "ON_DEMAND_PROJECTION_ENABLED")
 		genericState, genericReason := "healthy", "GENERIC_JSON_ENABLED"
 		if cfg.Runtime.Mode == config.ModeMinimum {
@@ -156,6 +176,9 @@ func Run(ctx context.Context, cfg config.Config, logger *logging.Logger, build v
 	}
 	if collectorManager != nil {
 		providers = append(providers, collectorManager)
+	}
+	if dashboardHandler != nil {
+		providers = append(providers, dashboardHandler)
 	}
 	err = NewServer(cfg, logger, build, store, failure, providers...).Serve(runContext, listener)
 	cancel()

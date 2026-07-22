@@ -164,6 +164,7 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer, lookup co
 			Mode                    string `json:"mode"`
 			EnabledCollectors       int    `json:"enabled_collectors"`
 			ActivityWatchCollectors int    `json:"activitywatch_collectors"`
+			DashboardEnabled        bool   `json:"dashboard_enabled"`
 		}{
 			Status:                  "ok",
 			SchemaVersion:           cfg.SchemaVersion,
@@ -178,6 +179,7 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer, lookup co
 			Mode:                    cfg.Runtime.Mode,
 			EnabledCollectors:       enabledCollectors,
 			ActivityWatchCollectors: enabledActivityWatch,
+			DashboardEnabled:        cfg.DashboardIsEnabled(),
 		}
 		if err := writeJSON(stdout, result); err != nil {
 			logger.Error("cli", "config_output_failed", "CLI_OUTPUT_FAILED", "write config validation output", err)

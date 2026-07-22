@@ -1,0 +1,95 @@
+:root {
+  color: #18212f;
+  background: #f4f7fb;
+  font-family: "Segoe UI", "Microsoft YaHei UI", system-ui, sans-serif;
+  font-size: 16px;
+  line-height: 1.55;
+  --surface: #ffffff;
+  --border: #d8e0ea;
+  --muted: #526173;
+  --primary: #245b9e;
+  --primary-dark: #194577;
+  --good: #126449;
+  --good-bg: #e8f5ef;
+  --warning: #76500b;
+  --warning-bg: #fff4d6;
+  --danger: #922f2b;
+  --danger-bg: #fbe9e7;
+  --unknown: #4f5865;
+  --unknown-bg: #edf0f4;
+  --focus: #005fcc;
+}
+
+* { box-sizing: border-box; }
+body { margin: 0; min-width: 320px; }
+button { font: inherit; }
+.skip-link { position: absolute; left: 1rem; top: -5rem; z-index: 50; padding: .75rem 1rem; background: #fff; color: #111; border: 2px solid var(--focus); }
+.skip-link:focus { top: 1rem; }
+.topbar { max-width: 1440px; margin: 0 auto; padding: 2rem clamp(1rem, 3vw, 3rem) 1rem; display: flex; align-items: flex-end; justify-content: space-between; gap: 2rem; }
+.eyebrow, .section-kicker { margin: 0 0 .25rem; color: var(--primary); font-size: .75rem; font-weight: 700; letter-spacing: .1em; text-transform: uppercase; }
+h1, h2 { margin: 0; line-height: 1.2; }
+h1 { font-size: clamp(1.75rem, 4vw, 2.5rem); letter-spacing: -.03em; }
+h2 { font-size: 1.1rem; }
+.subtitle { max-width: 68ch; margin: .5rem 0 0; color: var(--muted); }
+.header-actions { display: flex; align-items: center; flex-wrap: wrap; justify-content: flex-end; gap: .75rem; }
+.mode-badge { min-height: 44px; display: inline-flex; align-items: center; padding: .55rem .85rem; border: 1px solid var(--border); border-radius: .55rem; background: var(--surface); font-weight: 650; }
+button { min-height: 44px; border: 1px solid var(--primary); border-radius: .55rem; padding: .6rem 1rem; color: #fff; background: var(--primary); cursor: pointer; transition: background-color 180ms ease, border-color 180ms ease; }
+button:hover { background: var(--primary-dark); border-color: var(--primary-dark); }
+button:disabled { cursor: wait; opacity: .65; }
+button:focus-visible, a:focus-visible { outline: 3px solid var(--focus); outline-offset: 3px; }
+.secondary-button { margin: 0 1.25rem 1.25rem; color: var(--primary); background: #fff; }
+.secondary-button:hover { color: #fff; }
+.last-updated { max-width: 1440px; margin: 0 auto; padding: 0 clamp(1rem, 3vw, 3rem) 1rem; color: var(--muted); font-size: .9rem; }
+.error-banner { max-width: calc(1440px - 2rem); margin: 0 auto 1rem; padding: .85rem 1rem; border: 1px solid #d9938f; border-radius: .65rem; background: var(--danger-bg); color: var(--danger); font-weight: 650; }
+.dashboard { max-width: 1440px; margin: 0 auto; padding: 0 clamp(1rem, 3vw, 3rem) 2rem; display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 1rem; }
+.panel { min-width: 0; border: 1px solid var(--border); border-radius: .8rem; background: var(--surface); box-shadow: 0 1px 2px rgba(24, 33, 47, .04); }
+.panel-wide { grid-column: 1 / -1; }
+.panel-heading { min-height: 74px; padding: 1rem 1.25rem; display: flex; align-items: center; justify-content: space-between; gap: 1rem; border-bottom: 1px solid var(--border); }
+.panel-note { margin: 0; color: var(--muted); font-size: .82rem; text-align: right; }
+.panel-content { padding: 1rem 1.25rem 1.25rem; overflow-wrap: anywhere; }
+.empty { margin: 0; color: var(--muted); }
+.metric-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: .75rem; }
+.metric { min-width: 0; padding: .75rem; border: 1px solid var(--border); border-radius: .6rem; background: #f9fbfd; }
+.metric dt { color: var(--muted); font-size: .8rem; }
+.metric dd { margin: .25rem 0 0; font-weight: 700; }
+.status-list, .timeline-list, .fault-list { list-style: none; margin: 0; padding: 0; display: grid; gap: .65rem; }
+.status-row, .timeline-row, .fault-row { padding: .75rem; border: 1px solid var(--border); border-radius: .6rem; background: #fbfcfe; }
+.row-top { display: flex; justify-content: space-between; align-items: flex-start; gap: 1rem; }
+.row-title { margin: 0; font-weight: 700; }
+.row-meta, .row-detail { margin: .25rem 0 0; color: var(--muted); font-size: .86rem; }
+.state { display: inline-flex; align-items: center; gap: .4rem; border-radius: 999px; padding: .25rem .55rem; font-size: .78rem; font-weight: 750; white-space: nowrap; }
+.state::before { content: ""; width: .45rem; height: .45rem; border-radius: 50%; background: currentColor; }
+.state-good { color: var(--good); background: var(--good-bg); }
+.state-info { color: #225b85; background: #e8f2fa; }
+.state-warning { color: var(--warning); background: var(--warning-bg); }
+.state-danger { color: var(--danger); background: var(--danger-bg); }
+.state-muted, .state-unknown { color: var(--unknown); background: var(--unknown-bg); }
+.quality-list { display: flex; flex-wrap: wrap; gap: .35rem; margin-top: .5rem; }
+.quality { border: 1px solid #c5a565; border-radius: .35rem; padding: .15rem .4rem; color: #6a4707; background: #fff8e6; font-size: .75rem; font-weight: 650; }
+.table-wrap { overflow-x: auto; }
+table { width: 100%; border-collapse: collapse; font-size: .9rem; }
+th, td { padding: .7rem .6rem; border-bottom: 1px solid var(--border); text-align: left; vertical-align: top; }
+th { color: var(--muted); font-size: .78rem; letter-spacing: .02em; }
+tbody tr:last-child td { border-bottom: 0; }
+footer { max-width: 1440px; margin: 0 auto; padding: 0 clamp(1rem, 3vw, 3rem) 2rem; color: var(--muted); font-size: .85rem; }
+
+@media (max-width: 900px) {
+  .dashboard { grid-template-columns: 1fr 1fr; }
+  .panel-wide { grid-column: 1 / -1; }
+  .topbar { align-items: flex-start; flex-direction: column; }
+  .header-actions { justify-content: flex-start; }
+}
+
+@media (max-width: 620px) {
+  .dashboard { grid-template-columns: 1fr; }
+  .panel, .panel-wide { grid-column: 1; }
+  .metric-grid { grid-template-columns: 1fr; }
+  .panel-heading, .row-top { align-items: flex-start; flex-direction: column; }
+  .panel-note { text-align: left; }
+  .header-actions, .header-actions button { width: 100%; }
+  .mode-badge { width: 100%; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { scroll-behavior: auto !important; transition: none !important; }
+}

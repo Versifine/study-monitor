@@ -1,0 +1,64 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>Exam Monitor · 只读仪表盘</title>
+  <link rel="stylesheet" href="/assets/styles.css">
+  <script type="module" src="/assets/app.js"></script>
+</head>
+<body>
+  <a class="skip-link" href="#main-content">跳到主要内容</a>
+  <header class="topbar">
+    <div>
+      <p class="eyebrow">Exam Monitor</p>
+      <h1>学习证据状态</h1>
+      <p class="subtitle">只显示事实、覆盖缺口与运行健康，不提供任何修改入口。</p>
+    </div>
+    <div class="header-actions">
+      <div id="runtime-mode" class="mode-badge" aria-live="polite">模式：加载中</div>
+      <button id="refresh" type="button">刷新只读数据</button>
+    </div>
+  </header>
+
+  <div id="page-error" class="error-banner" role="alert" hidden></div>
+  <p id="last-updated" class="last-updated" aria-live="polite">尚未完成读取</p>
+
+  <main id="main-content" class="dashboard" tabindex="-1">
+    <section id="panel-storage" class="panel" data-panel="storage" aria-labelledby="storage-heading">
+      <div class="panel-heading"><div><p class="section-kicker">存储</p><h2 id="storage-heading">磁盘与保护</h2></div></div>
+      <div id="storage-content" class="panel-content" aria-live="polite"><p class="empty">加载中</p></div>
+    </section>
+
+    <section id="panel-collectors" class="panel" data-panel="collectors" aria-labelledby="collectors-heading">
+      <div class="panel-heading"><div><p class="section-kicker">采集器</p><h2 id="collectors-heading">来源状态</h2></div></div>
+      <div id="collectors-content" class="panel-content" aria-live="polite"><p class="empty">加载中</p></div>
+    </section>
+
+    <section id="panel-backlog" class="panel" data-panel="backlog" aria-labelledby="backlog-heading">
+      <div class="panel-heading"><div><p class="section-kicker">积压</p><h2 id="backlog-heading">待处理与未上报</h2></div></div>
+      <div id="backlog-content" class="panel-content" aria-live="polite"><p class="empty">加载中</p></div>
+    </section>
+
+    <section id="panel-coverage" class="panel panel-wide" data-panel="coverage" aria-labelledby="coverage-heading">
+      <div class="panel-heading"><div><p class="section-kicker">覆盖率</p><h2 id="coverage-heading">今日覆盖与质量</h2></div><p class="panel-note">本地自然日 · 最多显示 200 个区间</p></div>
+      <div id="coverage-content" class="panel-content" aria-live="polite"><p class="empty">加载中</p></div>
+    </section>
+
+    <section id="panel-timeline" class="panel panel-wide" data-panel="timeline" aria-labelledby="timeline-heading">
+      <div class="panel-heading"><div><p class="section-kicker">时间线</p><h2 id="timeline-heading">今日证据</h2></div><p class="panel-note">每页 50 条 · 单次最多 200 条</p></div>
+      <div id="timeline-content" class="panel-content" aria-live="polite"><p class="empty">加载中</p></div>
+      <button id="timeline-more" class="secondary-button" type="button" hidden>加载下一页</button>
+    </section>
+
+    <section id="panel-faults" class="panel panel-wide" data-panel="faults" aria-labelledby="faults-heading">
+      <div class="panel-heading"><div><p class="section-kicker">最近故障</p><h2 id="faults-heading">故障、恢复与降级</h2></div><p class="panel-note">最近 20 条，仅显示稳定错误码</p></div>
+      <div id="faults-content" class="panel-content" aria-live="polite"><p class="empty">加载中</p></div>
+    </section>
+  </main>
+
+  <footer>本页面不自动轮询；关闭页面不会影响采集、恢复或备份。</footer>
+  <noscript><p class="error-banner">浏览器已禁用 JavaScript，无法读取只读状态；Recorder Core 采集不受影响。</p></noscript>
+</body>
+</html>

@@ -18,6 +18,9 @@ func TestLoadDefaultsAreSafe(t *testing.T) {
 	if cfg.SchemaVersion != CurrentSchemaVersion {
 		t.Fatalf("SchemaVersion = %d", cfg.SchemaVersion)
 	}
+	if !cfg.DashboardIsEnabled() {
+		t.Fatal("dashboard must default to enabled in record-only mode")
+	}
 	if cfg.Server.ListenAddress != "127.0.0.1:47831" {
 		t.Fatalf("ListenAddress = %q", cfg.Server.ListenAddress)
 	}
@@ -107,6 +110,7 @@ func TestLoadEnvironmentOverridesFile(t *testing.T) {
 		EnvMediaScanEntries: "250",
 		EnvFFprobePath:      `D:\tools\ffprobe.exe`,
 		EnvFFprobeTimeout:   "20s",
+		EnvDashboardEnabled: "false",
 	})
 	cfg, err := Load(path, lookup)
 	if err != nil {
@@ -131,6 +135,18 @@ func TestLoadEnvironmentOverridesFile(t *testing.T) {
 		cfg.MediaIngest.MaxSidecarBytes != 32768 || cfg.MediaIngest.MaxScanEntries != 250 ||
 		cfg.MediaIngest.FFprobePath != `D:\tools\ffprobe.exe` || cfg.FFprobeTimeout() != 20*time.Second {
 		t.Fatalf("media environment override not applied: %+v", cfg.MediaIngest)
+	}
+	if cfg.DashboardIsEnabled() {
+		t.Fatal("dashboard environment override was not applied")
+	}
+}
+
+func TestDashboardIsAlwaysDisabledInMinimumMode(t *testing.T) {
+	cfg := defaultConfig()
+	cfg.Runtime.Mode = ModeMinimum
+	cfg.DashboardEnabled = true
+	if cfg.DashboardIsEnabled() {
+		t.Fatal("minimum mode must close the optional dashboard")
 	}
 }
 

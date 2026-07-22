@@ -1,0 +1,15 @@
+{
+  "name": "exam-monitor-dashboard",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": "24.11.1"
+  },
+  "scripts": {
+    "build": "node --no-warnings build.mjs",
+    "check": "node --no-warnings build.mjs --check",
+    "test": "node --test tests/*.test.mjs"
+  },
+  "dependencies": {},
+  "devDependencies": {}
+}

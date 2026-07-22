@@ -46,6 +46,8 @@ go.work.sum
 node_modules/
 .pnpm-store/
 dist/
+!/web/dist/
+!/web/dist/**
 .next/
 .vite/
 .nyc_output/

@@ -72,6 +72,7 @@ const (
 	EnvFFprobePath      = "EXAM_MONITOR_FFPROBE_PATH"
 	EnvFFprobeTimeout   = "EXAM_MONITOR_FFPROBE_TIMEOUT"
 	EnvRuntimeMode      = "EXAM_MONITOR_MODE"
+	EnvDashboardEnabled = "EXAM_MONITOR_DASHBOARD_ENABLED"
 
 	envLocalAppData = "LOCALAPPDATA"
 )
@@ -79,7 +80,7 @@ const (
 // LookupEnv matches os.LookupEnv and makes environment overrides deterministic in tests.
 type LookupEnv func(string) (string, bool)
 
-// Config is the complete Recorder Core configuration contract through M4.
+// Config is the complete Recorder Core configuration contract through M5.
 type Config struct {
 	SchemaVersion int               `json:"schema_version"`
 	Runtime       RuntimeConfig     `json:"runtime"`
@@ -93,6 +94,9 @@ type Config struct {
 	Operations    OperationsConfig  `json:"operations"`
 	Retention     RetentionConfig   `json:"retention"`
 	Logging       LoggingConfig     `json:"logging"`
+	// DashboardEnabled is environment-only so the version 1 JSON schema remains
+	// compatible with the previous stable M4 binary during rollback.
+	DashboardEnabled bool `json:"-"`
 }
 
 const (
@@ -299,7 +303,8 @@ func defaultConfig() Config {
 			Enabled: false, ScanInterval: "1h", MinimumAge: "168h",
 			RequireFullBackup: true, MaxDeletesPerRun: 100,
 		},
-		Logging: LoggingConfig{Level: "info", FileEnabled: true, MaxFileBytes: 10 << 20, MaxFiles: 5},
+		Logging:          LoggingConfig{Level: "info", FileEnabled: true, MaxFileBytes: 10 << 20, MaxFiles: 5},
+		DashboardEnabled: true,
 	}
 }
 
@@ -463,6 +468,13 @@ func validateCollectorJSON(raw json.RawMessage) error {
 func applyEnvironment(cfg *Config, lookup LookupEnv) error {
 	if value, ok := lookup(EnvRuntimeMode); ok {
 		cfg.Runtime.Mode = value
+	}
+	if value, ok := lookup(EnvDashboardEnabled); ok {
+		parsed, err := strconv.ParseBool(value)
+		if err != nil {
+			return &Error{Code: CodeInvalidEnv, Err: fmt.Errorf("%s must be a boolean", EnvDashboardEnabled)}
+		}
+		cfg.DashboardEnabled = parsed
 	}
 	if value, ok := lookup(EnvListenAddress); ok {
 		cfg.Server.ListenAddress = value
@@ -1070,6 +1082,12 @@ func (cfg Config) TempCleanupInterval() time.Duration {
 func (cfg Config) TempMaxAge() time.Duration {
 	duration, _ := time.ParseDuration(cfg.Operations.TempMaxAge)
 	return duration
+}
+
+// DashboardIsEnabled returns the effective optional UI state. Minimum mode
+// always closes the non-essential dashboard even if its environment switch is on.
+func (cfg Config) DashboardIsEnabled() bool {
+	return cfg.DashboardEnabled && cfg.Runtime.Mode == ModeRecordOnly
 }
 
 func (cfg Config) RetentionScanInterval() time.Duration {

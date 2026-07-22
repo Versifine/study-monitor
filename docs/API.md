@@ -1,6 +1,6 @@
-# M1-M3 本地 API
+# M1-M5 本地 API
 
-本文冻结 M1 的仅追加事件写入/查询/健康接口、M2 的媒体入口状态，以及 M3 的通用 Evidence、心跳、采集器状态、覆盖率和统一时间线。所有接口默认只监听 loopback；媒体数据面使用受管文件入口而不是 HTTP 上传。M3 不包含前端、AI、原生手机/健康连接器或复杂认证。
+本文冻结 M1 的仅追加事件写入/查询/健康接口、M2 的媒体入口状态、M3 的通用 Evidence/心跳/采集器状态/覆盖率/统一时间线、M4 的运维状态，以及 M5 的只读仪表盘汇总。所有接口默认只监听 loopback；媒体数据面使用受管文件入口而不是 HTTP 上传。M5 不包含 AI、分析队列、原生手机/健康连接器或复杂认证。
 
 ## 1. 通用规则
 
@@ -8,6 +8,7 @@
 - 写入端点只接受 `Content-Type: application/json`，任何非空 `Origin` 请求头都被拒绝，防止本地网页静默提交。
 - 响应包含 `Cache-Control: no-store`；错误响应包含稳定错误码，不返回或记录 Evidence payload。
 - 请求体、批量条数、单事件大小、payload 深度、并发写入和查询页大小均由 `api` 配置限制。
+- 只读端点只接受 GET 和 HEAD；HEAD 返回同状态与响应头但不返回 body，其他方法返回 405 和 `Allow`。
 
 ## 2. 写入事件
 
@@ -138,7 +139,26 @@ M4 数据库保留空间受威胁时，即使 SQLite 仍可探测为可写，`/h
 
 返回 `schema_version=1`、`disk_level`（`normal|warning|critical|reserve`；存储初始化失败时为 `unavailable`）、`free_bytes`、最近 `checked_at_utc`、可选稳定 `error_code` 和 `retention`（默认 `disabled`）。该端点是只读状态，不提供改变水位、启用删除、执行备份或回滚的 HTTP 操作；高风险运维只能走本机 PowerShell 脚本。存储打开失败时不会以 `normal/free_bytes=0` 假报健康。
 
-## 11. 默认限制
+## 11. M5 仪表盘与汇总
+
+`GET|HEAD /` 返回构建后嵌入候选 Go 二进制的静态只读页面。资源仅限 `/index.html`、`/assets/styles.css`、`/assets/state.js` 和 `/assets/app.js`；其他路径为 404，非 GET/HEAD 为 405。响应使用禁止外部来源、表单提交和 frame 嵌入的 CSP。页面没有 Evidence、计划、保留、模式、模型、备份或回滚的修改入口。
+
+`GET|HEAD /api/v1/dashboard/summary` 返回：
+
+- `generated_at_utc` 和当前 `runtime_mode`
+- M4 `operations` 与 M2 `media` 状态
+- 启用采集器当前状态
+- 分析状态；M5 固定为 `not_installed`、`backlog=null`，不创建分析队列
+- 每个启用外部采集器的积压状态；未提供外部积压合同时固定为 `unknown` 且数量/字节为 `null`，不得伪装成零
+- 最近最多 20 条故障、每个模块的最新状态和最近模式切换；故障 `detail` 不返回浏览器
+
+汇总查询错误使用既有稳定 JSON 错误 envelope；存储暂时不可查询时返回 HTTP 503。时间线和覆盖率继续使用第 8、9 节的有界接口：M5 前端每页读取 50 条、单次刷新最多 200 条时间线，并最多渲染 200 个覆盖区间；三类请求顺序执行且页面不自动轮询。
+
+仪表盘默认只在 `record-only` 模式注册。`EXAM_MONITOR_DASHBOARD_ENABLED=false` 或 `minimum` 模式会关闭静态资源和汇总路由；嵌入资源缺失/损坏同样只停用处理器。上述任一情况均不改变 `/health/live`、`/health/ready`、写入 API、后台采集、恢复、备份或回滚。
+
+完整前端状态语义和构建合同见 [`DASHBOARD.md`](DASHBOARD.md)。
+
+## 12. 默认限制
 
 | 配置 | 默认值 |
 |---|---:|

@@ -54,6 +54,12 @@ M4 安全默认值为：预警 `10 GiB`、关键 `5 GiB`、数据库保留空间
 
 日志写入 `<data>\logs\exam-monitor.jsonl`，默认每份 `10 MiB`、保留 5 份。WAL 默认每 5 分钟 checkpoint；超过 `64 MiB` 时请求 `TRUNCATE`。临时清理只识别 `<data>\media\staging` 内、名称为 64 位十六进制加 `.partial`、超过 24 小时且不被最新导入事实引用的普通文件；不扫描或删除来源入口、隔离区和未知文件。
 
+### 只读仪表盘
+
+Record-only 默认可在本机监听地址打开 `/`。页面显示六类事实状态但不自动轮询、不提供任何修改按钮；正常运行不需要 Node.js 或前端开发服务器。`EXAM_MONITOR_DASHBOARD_ENABLED=false` 可独立关闭，Minimum mode 始终关闭。关闭后根页面和 `/api/v1/dashboard/summary` 返回 404，但健康检查、写入、采集、恢复、备份和回滚保持原合同。
+
+若页面显示“未知”“无数据”“未上报”“已关闭”或“未安装”，不得人工改成零或正常；先按对应采集器 SLA 与稳定错误码判断是否需要维护。分析未安装是正常 Record-only 状态，不触发通知。仪表盘资源校验失败会把 dashboard 模块记录为 `unavailable/DASHBOARD_ASSETS_INVALID` 并继续 Recorder Core；不要在正式学习时现场修前端。
+
 ## 7. 备份与恢复
 
 备份分为：
@@ -105,7 +111,7 @@ $binary = (.\scripts\build.ps1 -OutputDirectory C:\ExamMonitorBuild | Select-Obj
 
 `rollback.ps1` 在停止任务前分别校验当前/上一版配置，并要求二者解析到同一个规范化数据库路径；schema 检查始终固定读取当前活动数据库，即使借用另一版本中支持维护 CLI 的二进制，也不能误查目标配置指向的另一数据库。M3 数据库没有 M4 账本时按 `m4=0` 检查，不兼容时拒绝。成功路径只切换应用/配置指针，启动任务并检查 `/health/live` 的版本和 `/health/ready`；失败时先结束失败进程，再恢复原指针并重启原版本。Windows 结束计划任务不会自动保证其 `exam-monitor.exe` 子进程退出，因此安装、回滚和卸载共用 `process-control.ps1`：只识别 `%LOCALAPPDATA%\ExamMonitor\releases` 下路径已验证的受管二进制，停止并等待清零，拒绝按未验证 PID 误杀其他进程。`uninstall.ps1` 删除任务和受管进程，但版本、配置、状态和 Evidence 均保留。
 
-M4 故障矩阵可运行 `.\scripts\fault-injection.ps1`；完整真实闭环由 `.\scripts\smoke.ps1` 执行，所有破坏性场景使用临时目录和唯一临时任务名。回滚 smoke 从固定提交 `89ed656` 构建真实 M3 二进制，先安装 M3 再安装候选，并在同一前向数据库上启动回滚后的 M3；不是只改版本字符串重编候选。
+M4 故障矩阵可运行 `.\scripts\fault-injection.ps1`；M5 完整真实闭环由 `.\scripts\smoke.ps1` 执行，除原有恢复/回滚场景外还从候选二进制打开嵌入页面、资源和汇总，所有破坏性场景使用临时目录和唯一临时任务名。回滚 smoke 从固定提交 `89ed656` 构建真实 M3 二进制，先安装 M3 再安装候选，并在同一前向数据库上启动回滚后的 M3；不是只改版本字符串重编候选。
 
 ## 9. 升级
 

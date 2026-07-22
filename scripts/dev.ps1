@@ -39,6 +39,7 @@ if (-not $hadDataDirectory) {
 
 Push-Location $repoRoot
 try {
+    & (Join-Path $PSScriptRoot 'build-web.ps1') -Check
     $arguments = @('-mod=vendor', './cmd/exam-monitor')
     if ($Config) {
         $arguments += "--config=$Config"

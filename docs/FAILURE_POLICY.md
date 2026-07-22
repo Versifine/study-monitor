@@ -39,7 +39,7 @@
 | 媒体仍在写或 sidecar 缺失 | 来源文件 | 保持 `pending`，不导入 | `pending` |
 | 媒体校验失败 | 来源文件、隔离副本和原因 | 隔离，不进入 `accepted` | `corrupt` 质量标记/故障 |
 | 覆盖率计算失败 | 原始事件、心跳和媒体事实 | 停止投影，时间线原始事实仍可查 | 投影 `stale` |
-| 仪表盘失败 | API、采集和运维 | 关闭界面处理器 | dashboard `disabled` |
+| 仪表盘关闭或资源失败 | API、采集和运维 | 不注册界面/汇总路由，继续 Recorder Core | `disabled` 或 `unavailable/DASHBOARD_ASSETS_INVALID` |
 | 数据库不可写 | 外部缓存、媒体来源和临时文件 | 不确认新写入，停止保留删除 | P0/P1 故障 |
 | 磁盘预警 | 已有 Evidence | 停可选分析和低优先级导入 | `warning` |
 | 磁盘关键 | 已有 Evidence、数据库保留空间 | 拒绝新媒体，保留小型核心事件 | `critical` |
@@ -56,6 +56,14 @@
 - 媒体在磁盘预警及以上返回 `MEDIA_STORAGE_PROTECTED`；每个候选、每个 1 MiB 复制块和原子改名前都直接刷新系统可用空间，保留来源/暂存未确认数据。数据库保留空间受威胁时，HTTP 与 ActivityWatch/媒体元数据在实际提交前同样实时探测并停止确认，API 返回 HTTP 507；30 秒后台扫描只负责周期状态和故障事实，不是提交门控的数据源。
 - 覆盖率失败只在状态转移时追加 degraded 故障和模块状态，后续成功追加 `COVERAGE_RECOVERED`/healthy；权威事实和其他读取不受投影失败影响。
 - 保留删除先追加 `planned`；文件删除后，`deleted`、媒体 `retention_deleted` 和投影在同一事务提交。事务失败仍保持可重试的 `planned`，普通缺失不能伪装成保留删除。
+
+## M5 界面故障隔离
+
+- 静态资源在启动时一次性校验并读取；任一资源缺失或为空会关闭整个仪表盘处理器，不提供不完整页面。
+- 汇总、时间线或覆盖率读取失败只在页面内显示稳定错误/无数据，不改变写入 readiness，也不重试成无限轮询。
+- 浏览器请求有 8 秒等待上限，页面只按用户刷新串行读取；关闭页面不会停止或取消后台采集。
+- Minimum mode 与 `EXAM_MONITOR_DASHBOARD_ENABLED=false` 是明确关闭，不是假报健康；分析始终为 `not_installed`，不产生隐藏队列。
+- 静态资源和汇总仅接受 GET/HEAD，页面无表单；浏览器不能借 M5 修改 Evidence、保留、计划、模式或模型状态。
 
 ## 必须接受的简单替代
 

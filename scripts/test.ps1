@@ -40,6 +40,12 @@ try {
         throw "Go version mismatch: required go$requiredGo, found $actualGo"
     }
 
+    & (Join-Path $PSScriptRoot 'build-web.ps1') -Check
+    & node --test 'web/tests/*.test.mjs'
+    if ($LASTEXITCODE -ne 0) {
+        throw "dashboard state tests failed with exit code $LASTEXITCODE"
+    }
+
     $goFiles = @(Get-ChildItem -Path 'cmd', 'internal' -Recurse -File -Filter '*.go' | ForEach-Object { $_.FullName })
     $unformatted = @(& gofmt -l $goFiles)
     if ($LASTEXITCODE -ne 0) {

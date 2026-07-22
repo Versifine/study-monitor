@@ -5,8 +5,8 @@
 ## 当前状态
 
 - Version 1 设计审查已完成
-- M0 仓库与开发工具、M1 仅追加事件存储与本地 API、M2 外部媒体分段导入、M3 采集器与统一时间线、M4 恢复/保留/备份/回滚已完成
-- M5 尚未开始，必须作为后续独立任务执行
+- M0 仓库与开发工具、M1 仅追加事件存储与本地 API、M2 外部媒体分段导入、M3 采集器与统一时间线、M4 恢复/保留/备份/回滚、M5 最小只读仪表盘已完成
+- M6 尚未开始，必须作为后续独立任务执行，14 天认证不得提前计时
 - 时间不是当前最高风险；质量门槛优先于日历日期，M6 的 14 天认证不能压缩
 
 ## 三条阅读路径
@@ -38,7 +38,8 @@
 | [`V1_FREEZE_SPEC.md`](V1_FREEZE_SPEC.md) | Version 1 范围、模式和冻结完成线 |
 | [`ARCHITECTURE.md`](ARCHITECTURE.md) | 单体架构、模块边界和建议目录 |
 | [`DATA_MODEL.md`](DATA_MODEL.md) | 追加事实、投影、时间和版本规则 |
-| [`API.md`](API.md) | M1-M4 本地事件、健康、心跳、时间线、覆盖率和运维状态接口合同 |
+| [`API.md`](API.md) | M1-M5 本地事件、健康、心跳、时间线、覆盖率、运维和仪表盘汇总接口合同 |
+| [`DASHBOARD.md`](DASHBOARD.md) | M5 嵌入式只读前端、状态语义、构建和故障隔离合同 |
 | [`MEDIA_INGEST.md`](MEDIA_INGEST.md) | M2 外部媒体 sidecar、ready、受管存储、隔离和恢复合同 |
 | [`COLLECTORS_AND_TIMELINE.md`](COLLECTORS_AND_TIMELINE.md) | M3 ActivityWatch、通用 JSON、心跳、覆盖率与时间线合同 |
 | [`EVIDENCE_AND_INFERENCE.md`](EVIDENCE_AND_INFERENCE.md) | Evidence/Observation/Inference 分层边界 |
@@ -83,7 +84,7 @@
 
 ## 下一步
 
-1. 审查 M4 diff、测试、构建、故障注入和 smoke 结果。
-2. 为 M4 创建独立 Git 检查点并停止。
-3. 只有在下一次明确任务中，才使用 `codex-prompts/06_M5.txt` 开始 M5。
-4. 不要提前进入前端、M6 认证或 AI。
+1. 审查 M5 diff、前端状态测试、API 契约、离线构建、浏览器验收和 smoke 结果。
+2. 为 M5 创建独立 Git 检查点并停止。
+3. 只有在下一次明确任务中，才使用 `codex-prompts/07_M6.txt` 开始 M6。
+4. 不要提前开始 14 天认证或进入 AI。

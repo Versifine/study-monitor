@@ -52,6 +52,34 @@ type MediaManifestEntry struct {
 	Status              string `json:"status"`
 }
 
+type DashboardFault struct {
+	Module        string `json:"module"`
+	Severity      string `json:"severity"`
+	Status        string `json:"status"`
+	ErrorCode     string `json:"error_code"`
+	OccurredAtUTC string `json:"occurred_at_utc"`
+}
+
+type DashboardModuleState struct {
+	Module        string `json:"module"`
+	Status        string `json:"status"`
+	ReasonCode    string `json:"reason_code"`
+	OccurredAtUTC string `json:"occurred_at_utc"`
+}
+
+type DashboardModeTransition struct {
+	OldMode       string `json:"old_mode"`
+	NewMode       string `json:"new_mode"`
+	ReasonCode    string `json:"reason_code"`
+	OccurredAtUTC string `json:"occurred_at_utc"`
+}
+
+type DashboardHistory struct {
+	RecentFaults []DashboardFault         `json:"recent_faults"`
+	Modules      []DashboardModuleState   `json:"modules"`
+	Mode         *DashboardModeTransition `json:"mode,omitempty"`
+}
+
 func eventKey(parts ...string) string {
 	digest := sha256.Sum256([]byte(strings.Join(parts, "\x00")))
 	return hex.EncodeToString(digest[:])
@@ -105,6 +133,72 @@ VALUES(?, ?, ?, ?, ?, ?, ?) ON CONFLICT(event_key) DO NOTHING`,
 		return classifySQLiteError(CodeWriteFailed, "commit mode transition", err)
 	}
 	return nil
+}
+
+// QueryDashboardHistory returns only bounded, read-only operational summaries.
+// It never exposes fault detail because detail may contain machine-local context
+// that is unnecessary for the minimum dashboard.
+func (store *Store) QueryDashboardHistory(ctx context.Context, faultLimit int) (DashboardHistory, error) {
+	if faultLimit < 1 || faultLimit > 100 {
+		return DashboardHistory{}, &Error{Code: CodePageLimitInvalid, Err: errors.New("dashboard fault limit must be between 1 and 100")}
+	}
+	result := DashboardHistory{RecentFaults: make([]DashboardFault, 0), Modules: make([]DashboardModuleState, 0)}
+	rows, err := store.db.QueryContext(ctx, `
+SELECT module, severity, status, error_code, occurred_at_utc
+FROM fault_events ORDER BY id DESC LIMIT ?`, faultLimit)
+	if err != nil {
+		return DashboardHistory{}, classifySQLiteError(CodeQueryFailed, "query dashboard faults", err)
+	}
+	for rows.Next() {
+		var fault DashboardFault
+		if err := rows.Scan(&fault.Module, &fault.Severity, &fault.Status, &fault.ErrorCode, &fault.OccurredAtUTC); err != nil {
+			rows.Close()
+			return DashboardHistory{}, classifySQLiteError(CodeQueryFailed, "scan dashboard fault", err)
+		}
+		result.RecentFaults = append(result.RecentFaults, fault)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return DashboardHistory{}, classifySQLiteError(CodeQueryFailed, "iterate dashboard faults", err)
+	}
+	if err := rows.Close(); err != nil {
+		return DashboardHistory{}, wrap(CodeQueryFailed, "close dashboard fault rows", err)
+	}
+
+	rows, err = store.db.QueryContext(ctx, `
+SELECT state.module, state.status, state.reason_code, state.occurred_at_utc
+FROM module_state_events state
+JOIN (SELECT module, MAX(id) AS id FROM module_state_events GROUP BY module) latest ON latest.id = state.id
+ORDER BY state.module LIMIT 64`)
+	if err != nil {
+		return DashboardHistory{}, classifySQLiteError(CodeQueryFailed, "query dashboard module states", err)
+	}
+	for rows.Next() {
+		var state DashboardModuleState
+		if err := rows.Scan(&state.Module, &state.Status, &state.ReasonCode, &state.OccurredAtUTC); err != nil {
+			rows.Close()
+			return DashboardHistory{}, classifySQLiteError(CodeQueryFailed, "scan dashboard module state", err)
+		}
+		result.Modules = append(result.Modules, state)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return DashboardHistory{}, classifySQLiteError(CodeQueryFailed, "iterate dashboard module states", err)
+	}
+	if err := rows.Close(); err != nil {
+		return DashboardHistory{}, wrap(CodeQueryFailed, "close dashboard module state rows", err)
+	}
+
+	var mode DashboardModeTransition
+	err = store.db.QueryRowContext(ctx, `
+SELECT old_mode, new_mode, reason_code, occurred_at_utc
+FROM mode_transition_events ORDER BY id DESC LIMIT 1`).Scan(&mode.OldMode, &mode.NewMode, &mode.ReasonCode, &mode.OccurredAtUTC)
+	if err == nil {
+		result.Mode = &mode
+	} else if !errors.Is(err, sql.ErrNoRows) {
+		return DashboardHistory{}, classifySQLiteError(CodeQueryFailed, "query dashboard runtime mode", err)
+	}
+	return result, nil
 }
 
 func (store *Store) RetentionCandidates(ctx context.Context, cutoffUTC string, limit int) ([]RetentionCandidate, error) {

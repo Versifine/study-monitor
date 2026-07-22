@@ -68,6 +68,12 @@ type CollectorStatusProvider interface {
 type OperationsStatusProvider interface {
 	Status(context.Context) operations.Status
 }
+type DashboardStore interface {
+	QueryDashboardHistory(context.Context, int) (eventstore.DashboardHistory, error)
+}
+type DashboardHandlerProvider interface {
+	DashboardHandler() http.Handler
+}
 type WriteGate interface{ CoreWritesAllowed() (bool, string) }
 type FaultRecorder interface {
 	RecordFault(context.Context, string, string, string, string, string)
@@ -91,6 +97,8 @@ type Handler struct {
 	mediaStatus      MediaStatusProvider
 	collectorStatus  CollectorStatusProvider
 	operationsStatus OperationsStatusProvider
+	dashboardStore   DashboardStore
+	dashboard        http.Handler
 	writeGate        WriteGate
 	faultRecorder    FaultRecorder
 	moduleRecorder   ModuleStateRecorder
@@ -112,6 +120,11 @@ func New(cfg config.Config, logger *logging.Logger, build version.Info, store St
 	var writeGate WriteGate
 	var faultRecorder FaultRecorder
 	var moduleRecorder ModuleStateRecorder
+	var dashboardStore DashboardStore
+	if typed, ok := store.(DashboardStore); ok && typed != nil {
+		dashboardStore = typed
+	}
+	var dashboardHandler http.Handler
 	for _, provider := range providers {
 		if typed, ok := provider.(MediaStatusProvider); ok && typed != nil {
 			mediaStatus = typed
@@ -131,6 +144,9 @@ func New(cfg config.Config, logger *logging.Logger, build version.Info, store St
 		if typed, ok := provider.(ModuleStateRecorder); ok && typed != nil {
 			moduleRecorder = typed
 		}
+		if typed, ok := provider.(DashboardHandlerProvider); ok && typed != nil {
+			dashboardHandler = typed.DashboardHandler()
+		}
 	}
 	handler := &Handler{
 		config:           cfg,
@@ -141,6 +157,8 @@ func New(cfg config.Config, logger *logging.Logger, build version.Info, store St
 		mediaStatus:      mediaStatus,
 		collectorStatus:  collectorStatus,
 		operationsStatus: operationsStatus,
+		dashboardStore:   dashboardStore,
+		dashboard:        dashboardHandler,
 		writeGate:        writeGate,
 		faultRecorder:    faultRecorder,
 		moduleRecorder:   moduleRecorder,
@@ -159,6 +177,10 @@ func New(cfg config.Config, logger *logging.Logger, build version.Info, store St
 	handler.mux.HandleFunc("/api/v1/coverage", handler.handleCoverage)
 	handler.mux.HandleFunc("/api/v1/media/ingest/status", handler.handleMediaIngestStatus)
 	handler.mux.HandleFunc("/api/v1/operations/status", handler.handleOperationsStatus)
+	if handler.dashboard != nil {
+		handler.mux.HandleFunc("/api/v1/dashboard/summary", handler.handleDashboardSummary)
+		handler.mux.Handle("/", handler.dashboard)
+	}
 	return handler
 }
 
@@ -177,6 +199,69 @@ func (handler *Handler) handleOperationsStatus(writer http.ResponseWriter, reque
 		return
 	}
 	writeJSON(writer, request, http.StatusOK, handler.operationsStatus.Status(request.Context()))
+}
+
+type dashboardAnalysisStatus struct {
+	Status           string  `json:"status"`
+	Backlog          *int64  `json:"backlog"`
+	LastUpdatedAtUTC *string `json:"last_updated_utc"`
+}
+
+type dashboardExternalBacklog struct {
+	CollectorID      string  `json:"collector_id"`
+	Status           string  `json:"status"`
+	Items            *int64  `json:"items"`
+	Bytes            *int64  `json:"bytes"`
+	LastUpdatedAtUTC *string `json:"last_updated_utc"`
+}
+
+func (handler *Handler) handleDashboardSummary(writer http.ResponseWriter, request *http.Request) {
+	if !allowReadMethod(writer, request) {
+		return
+	}
+	if handler.dashboardStore == nil {
+		writeError(writer, request, http.StatusServiceUnavailable, CodeStorageOffline, "dashboard history storage is unavailable")
+		return
+	}
+	history, err := handler.dashboardStore.QueryDashboardHistory(request.Context(), 20)
+	if err != nil {
+		handler.writeStoreError(writer, request, "dashboard_summary_failed", err)
+		return
+	}
+	collectorsStatus := handler.collectorStatus.Status(request.Context())
+	if collectorsStatus == nil {
+		collectorsStatus = []collectors.Status{}
+	}
+	externalBacklogs := make([]dashboardExternalBacklog, 0, len(handler.config.Collectors)+len(collectorsStatus))
+	seenCollectors := make(map[string]struct{}, len(handler.config.Collectors)+len(collectorsStatus))
+	for _, collector := range handler.config.Collectors {
+		if !collector.Enabled {
+			continue
+		}
+		externalBacklogs = append(externalBacklogs, dashboardExternalBacklog{CollectorID: collector.ID, Status: "unknown"})
+		seenCollectors[collector.ID] = struct{}{}
+	}
+	for _, collector := range collectorsStatus {
+		if _, seen := seenCollectors[collector.CollectorID]; seen {
+			continue
+		}
+		externalBacklogs = append(externalBacklogs, dashboardExternalBacklog{CollectorID: collector.CollectorID, Status: "unknown"})
+	}
+	writeJSON(writer, request, http.StatusOK, struct {
+		SchemaVersion    int                         `json:"schema_version"`
+		GeneratedAtUTC   string                      `json:"generated_at_utc"`
+		RuntimeMode      string                      `json:"runtime_mode"`
+		Analysis         dashboardAnalysisStatus     `json:"analysis"`
+		Operations       operations.Status           `json:"operations"`
+		Media            mediaingest.Status          `json:"media"`
+		Collectors       []collectors.Status         `json:"collectors"`
+		ExternalBacklogs []dashboardExternalBacklog  `json:"external_backlogs"`
+		History          eventstore.DashboardHistory `json:"history"`
+	}{
+		SchemaVersion: APISchemaVersion, GeneratedAtUTC: time.Now().UTC().Format(time.RFC3339Nano), RuntimeMode: handler.config.Runtime.Mode,
+		Analysis: dashboardAnalysisStatus{Status: "not_installed"}, Operations: handler.operationsStatus.Status(request.Context()),
+		Media: handler.mediaStatus.Status(request.Context()), Collectors: collectorsStatus, ExternalBacklogs: externalBacklogs, History: history,
+	})
 }
 
 func (handler *Handler) handleMediaIngestStatus(writer http.ResponseWriter, request *http.Request) {

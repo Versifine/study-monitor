@@ -110,6 +110,13 @@ try {
     $minimumURL = "http://127.0.0.1:$minimumPort"
     [void](Wait-Ready -Process $minimumProcess -BaseURL $minimumURL)
     $operations = Invoke-RestMethod -Uri "$minimumURL/api/v1/operations/status" -Method Get -TimeoutSec 2
+    try {
+        Invoke-WebRequest -UseBasicParsing -Uri "$minimumURL/" -Method Get -TimeoutSec 2 | Out-Null
+        throw 'M5_MINIMUM_DASHBOARD_ENABLED'
+    }
+    catch {
+        if ($null -eq $_.Exception.Response -or $_.Exception.Response.StatusCode.value__ -ne 404) { throw }
+    }
     if ($operations.schema_version -ne 1 -or -not $operations.disk_level) { throw 'M4_OPERATIONS_STATUS_INVALID' }
     try {
         Invoke-WebRequest -UseBasicParsing -Uri "$minimumURL/api/v1/events/batch" -Method Post -ContentType 'application/json' -Body '{"schema_version":1,"events":[]}' -TimeoutSec 2 | Out-Null

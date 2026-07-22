@@ -24,9 +24,18 @@ func TestBuildScriptMarksUntrackedGoInputDirtyAndUsesLocalToolchain(t *testing.T
 	fixture := filepath.Join(t.TempDir(), "repository")
 	run(t, "git", "clone", "--quiet", "--no-hardlinks", "--local", repository, fixture)
 
+	copyFile(t, filepath.Join(repository, ".gitattributes"), filepath.Join(fixture, ".gitattributes"))
+	copyFile(t, filepath.Join(repository, ".gitignore"), filepath.Join(fixture, ".gitignore"))
 	copyFile(t, filepath.Join(repository, "scripts", "build.ps1"), filepath.Join(fixture, "scripts", "build.ps1"))
+	copyFile(t, filepath.Join(repository, "scripts", "build-web.ps1"), filepath.Join(fixture, "scripts", "build-web.ps1"))
+	for _, relative := range []string{
+		"package.json", "build.mjs", "src/index.html", "src/styles.css", "src/state.ts", "src/app.ts",
+		"dist/index.html", "dist/assets/styles.css", "dist/assets/state.js", "dist/assets/app.js",
+	} {
+		copyFile(t, filepath.Join(repository, "web", filepath.FromSlash(relative)), filepath.Join(fixture, "web", filepath.FromSlash(relative)))
+	}
 	if status := strings.TrimSpace(run(t, "git", "-C", fixture, "status", "--porcelain=v1", "--untracked-files=all")); status != "" {
-		run(t, "git", "-C", fixture, "add", "scripts/build.ps1")
+		run(t, "git", "-C", fixture, "add", ".gitattributes", ".gitignore", "scripts/build.ps1", "scripts/build-web.ps1", "web")
 		if staged := strings.TrimSpace(run(t, "git", "-C", fixture, "diff", "--cached", "--name-only")); staged != "" {
 			run(t, "git", "-C", fixture, "config", "user.name", "Exam Monitor Tests")
 			run(t, "git", "-C", fixture, "config", "user.email", "tests@example.invalid")
@@ -106,10 +115,10 @@ if ($env:GOPROXY -ne $beforeProxy) { throw 'dev.ps1 did not restore GOPROXY' }
 	runPowerShell(t, wrapper, nil)
 }
 
-func TestM4OperationalScriptsParseAsPowerShell(t *testing.T) {
+func TestOperationalScriptsParseAsPowerShell(t *testing.T) {
 	requireOuterWindowsTest(t)
 	repository := repositoryRoot(t)
-	names := []string{"process-control.ps1", "install.ps1", "uninstall.ps1", "run-supervised.ps1", "backup.ps1", "restore.ps1", "rollback.ps1", "smoke-m4.ps1", "fault-injection.ps1"}
+	names := []string{"build-web.ps1", "process-control.ps1", "install.ps1", "uninstall.ps1", "run-supervised.ps1", "backup.ps1", "restore.ps1", "rollback.ps1", "smoke-m4.ps1", "fault-injection.ps1"}
 	quoted := make([]string, len(names))
 	for index, name := range names {
 		quoted[index] = "'" + quotePowerShell(filepath.Join(repository, "scripts", name)) + "'"
@@ -180,6 +189,9 @@ func copyFile(t *testing.T, source, destination string) {
 	t.Helper()
 	contents, err := os.ReadFile(source)
 	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Dir(destination), 0o700); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(destination, contents, 0o600); err != nil {

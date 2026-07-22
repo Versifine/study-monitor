@@ -35,6 +35,8 @@ try {
         throw "Go version mismatch: required go$requiredGo, found $actualGo"
     }
 
+    & (Join-Path $PSScriptRoot 'build-web.ps1') -Check
+
     if (-not $Version) {
         $Version = (Get-Content -Raw -Encoding UTF8 'VERSION').Trim()
     }

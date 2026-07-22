@@ -558,6 +558,125 @@ func TestM3EvidenceHeartbeatTimelineCoverageAndStatusEndpoints(t *testing.T) {
 	_ = cfg
 }
 
+func TestM5DashboardSummaryMakesEmptyUnknownAndDegradedStatesExplicit(t *testing.T) {
+	_, store, cfg := newIntegratedHandler(t)
+	defer store.Close()
+	cfg.Collectors = []config.CollectorConfig{
+		{ID: "activitywatch", Kind: config.CollectorActivityWatch, Enabled: true},
+		{ID: "generic.one", Kind: config.CollectorGenericJSON, Enabled: true},
+		{ID: "disabled.one", Kind: config.CollectorGenericJSON, Enabled: false},
+	}
+	now := "2026-07-23T03:04:05Z"
+	if err := store.AppendFaultEvent(context.Background(), eventstore.FaultEvent{
+		Module: "activitywatch", Severity: "P2", Status: "degraded", ErrorCode: "COLLECTOR_DELAYED", Detail: "must not be exposed", OccurredAtUTC: now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.AppendModuleStateEvent(context.Background(), eventstore.ModuleStateEvent{
+		Module: "activitywatch", Status: "degraded", ReasonCode: "COLLECTOR_DELAYED", OccurredAtUTC: now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	collectorStatus := collectorStatusStub{statuses: []collectors.Status{{
+		CollectorID: "activitywatch", Kind: config.CollectorActivityWatch, Status: collectors.StatusUnavailable,
+		ErrorCode: "COLLECTOR_DELAYED", LastAttemptUTC: now,
+	}}}
+	mediaStatus := &mediaStatusStub{status: mediaingest.Status{
+		SchemaVersion: 1, Status: mediaingest.ModuleDisabled, FilesystemReadyBacklog: 0, FilesystemReadyBytes: 0,
+	}}
+	handler := New(cfg, testLogger(t), version.Info{Version: "0.6.0-test"}, store, StorageFailure{},
+		collectorStatus, mediaStatus, dashboardHandlerStub{handler: http.NotFoundHandler()})
+
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/api/v1/dashboard/summary", nil))
+	if response.Code != http.StatusOK {
+		t.Fatalf("summary status=%d body=%s", response.Code, response.Body.String())
+	}
+	var summary struct {
+		SchemaVersion int    `json:"schema_version"`
+		RuntimeMode   string `json:"runtime_mode"`
+		Analysis      struct {
+			Status  string `json:"status"`
+			Backlog *int64 `json:"backlog"`
+		} `json:"analysis"`
+		Media            mediaingest.Status  `json:"media"`
+		Collectors       []collectors.Status `json:"collectors"`
+		ExternalBacklogs []struct {
+			CollectorID string `json:"collector_id"`
+			Status      string `json:"status"`
+			Items       *int64 `json:"items"`
+		} `json:"external_backlogs"`
+		History eventstore.DashboardHistory `json:"history"`
+	}
+	decodeResponse(t, response, &summary)
+	if summary.SchemaVersion != 1 || summary.RuntimeMode != config.ModeRecordOnly {
+		t.Fatalf("summary identity = %#v", summary)
+	}
+	if summary.Analysis.Status != "not_installed" || summary.Analysis.Backlog != nil {
+		t.Fatalf("analysis absence became a zero backlog: %#v", summary.Analysis)
+	}
+	if len(summary.Collectors) != 1 || summary.Collectors[0].Status != collectors.StatusUnavailable {
+		t.Fatalf("collector degradation missing: %#v", summary.Collectors)
+	}
+	if len(summary.ExternalBacklogs) != 2 || summary.ExternalBacklogs[0].CollectorID != "activitywatch" || summary.ExternalBacklogs[1].CollectorID != "generic.one" || summary.ExternalBacklogs[0].Status != "unknown" || summary.ExternalBacklogs[0].Items != nil {
+		t.Fatalf("unreported external backlog became zero: %#v", summary.ExternalBacklogs)
+	}
+	if summary.Media.Status != mediaingest.ModuleDisabled || summary.Media.FilesystemReadyBacklog != 0 {
+		t.Fatalf("disabled media status or confirmed zero changed: %#v", summary.Media)
+	}
+	if len(summary.History.RecentFaults) != 1 || summary.History.RecentFaults[0].ErrorCode != "COLLECTOR_DELAYED" || len(summary.History.Modules) != 1 {
+		t.Fatalf("bounded history missing: %#v", summary.History)
+	}
+	if strings.Contains(response.Body.String(), "must not be exposed") {
+		t.Fatal("dashboard summary exposed fault detail")
+	}
+
+	head := httptest.NewRecorder()
+	handler.ServeHTTP(head, httptest.NewRequest(http.MethodHead, "/api/v1/dashboard/summary", nil))
+	if head.Code != http.StatusOK || head.Body.Len() != 0 {
+		t.Fatalf("summary HEAD status=%d body=%q", head.Code, head.Body.String())
+	}
+	method := httptest.NewRecorder()
+	handler.ServeHTTP(method, httptest.NewRequest(http.MethodPost, "/api/v1/dashboard/summary", nil))
+	if method.Code != http.StatusMethodNotAllowed || method.Header().Get("Allow") != "GET, HEAD" {
+		t.Fatalf("summary method status=%d allow=%q", method.Code, method.Header().Get("Allow"))
+	}
+}
+
+func TestM5DashboardSummaryErrorUsesStableAPIEnvelope(t *testing.T) {
+	cfg := testConfig(t)
+	store := &blockingStore{dashboardErr: &eventstore.Error{Code: eventstore.CodeQueryFailed, Err: errors.New("late dashboard query")}}
+	handler := New(cfg, testLogger(t), version.Info{Version: "0.6.0-test"}, store, StorageFailure{},
+		dashboardHandlerStub{handler: http.NotFoundHandler()})
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/api/v1/dashboard/summary", nil))
+	if response.Code != http.StatusServiceUnavailable || responseErrorCode(t, response) != eventstore.CodeQueryFailed {
+		t.Fatalf("summary error status=%d body=%s", response.Code, response.Body.String())
+	}
+}
+
+func TestM5DashboardAbsenceDoesNotAffectCoreReadinessOrWrites(t *testing.T) {
+	handler, store, _ := newIntegratedHandler(t)
+	defer store.Close()
+	for _, path := range []string{"/", "/api/v1/dashboard/summary"} {
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, httptest.NewRequest(http.MethodGet, path, nil))
+		if response.Code != http.StatusNotFound {
+			t.Fatalf("absent dashboard path %s status=%d", path, response.Code)
+		}
+	}
+	ready := httptest.NewRecorder()
+	handler.ServeHTTP(ready, httptest.NewRequest(http.MethodGet, "/health/ready", nil))
+	if ready.Code != http.StatusOK {
+		t.Fatalf("readiness status=%d body=%s", ready.Code, ready.Body.String())
+	}
+	write := performJSON(handler, http.MethodPost, "/api/v1/events/batch",
+		fmt.Sprintf(`{"schema_version":1,"events":[%s]}`, testEventJSON("dashboard-absent", `{}`)), nil)
+	if write.Code != http.StatusOK {
+		t.Fatalf("core write status=%d body=%s", write.Code, write.Body.String())
+	}
+}
+
 type batchResponse struct {
 	SchemaVersion int                      `json:"schema_version"`
 	Results       []eventstore.WriteResult `json:"results"`
@@ -575,6 +694,7 @@ type blockingStore struct {
 	release      chan struct{}
 	queryEntered chan struct{}
 	queryRelease chan struct{}
+	dashboardErr error
 }
 
 type mediaStatusStub struct {
@@ -583,9 +703,13 @@ type mediaStatusStub struct {
 
 type collectorStatusStub struct{ statuses []collectors.Status }
 
+type dashboardHandlerStub struct{ handler http.Handler }
+
 func (stub collectorStatusStub) Status(context.Context) []collectors.Status { return stub.statuses }
 
 func (stub *mediaStatusStub) Status(context.Context) mediaingest.Status { return stub.status }
+
+func (stub dashboardHandlerStub) DashboardHandler() http.Handler { return stub.handler }
 
 func (store *blockingStore) AppendBatch(_ context.Context, _ []eventstore.Candidate) ([]eventstore.WriteResult, error) {
 	close(store.entered)
@@ -615,6 +739,13 @@ func (*blockingStore) QueryPage(context.Context, string, int) (eventstore.Page, 
 
 func (*blockingStore) Readiness(context.Context) eventstore.Readiness {
 	return eventstore.Readiness{Status: eventstore.ReadinessWritable, SchemaVersion: eventstore.CurrentSchemaVersion}
+}
+
+func (store *blockingStore) QueryDashboardHistory(context.Context, int) (eventstore.DashboardHistory, error) {
+	if store.dashboardErr != nil {
+		return eventstore.DashboardHistory{}, store.dashboardErr
+	}
+	return eventstore.DashboardHistory{RecentFaults: []eventstore.DashboardFault{}, Modules: []eventstore.DashboardModuleState{}}, nil
 }
 
 func newIntegratedHandler(t *testing.T) (*Handler, *eventstore.Store, config.Config) {
