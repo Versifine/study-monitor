@@ -30,6 +30,16 @@
     "backup_restore": 1800,
     "rollback": 180
   },
+  "media_publisher": {
+    "device_name": "Integrated Camera",
+    "ffmpeg_path": "C:\\ffmpeg\\bin\\ffmpeg.exe",
+    "collector_id": "desk.media",
+    "daily_start_local": "20:00",
+    "segment_seconds": 300,
+    "segment_count": 3,
+    "clock_error_ms": 1000,
+    "acceptance_timeout_seconds": 120
+  },
   "planned_exercises": [
     { "id": "day02-network", "kind": "network_disconnect", "rto_key": "activitywatch", "relative_day": 2, "start_local": "18:00", "duration_minutes": 15 },
     { "id": "day03-process", "kind": "process_termination", "rto_key": "core_process", "relative_day": 3, "start_local": "18:00", "duration_minutes": 15 },

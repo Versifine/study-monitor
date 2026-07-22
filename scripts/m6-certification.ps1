@@ -25,6 +25,7 @@ $ErrorActionPreference = 'Stop'
 $sourceRepoRoot = Split-Path -Parent $PSScriptRoot
 $utf8NoBom = New-Object Text.UTF8Encoding($false)
 $requiredFFprobeVersion = 'N-117599-ge1d1ba4cbc-20241017'
+$requiredFFmpegVersion = 'N-117599-ge1d1ba4cbc-20241017'
 $requiredExerciseKinds = @(
     'network_disconnect', 'process_termination', 'system_reboot', 'write_interruption',
     'duplicate_submission', 'corrupt_media', 'low_disk', 'cloud_unavailable',
@@ -137,6 +138,14 @@ function Convert-IsoLocalToUtc {
     return [DateTimeOffset]::ParseExact("$LocalText$Offset", 'yyyy-MM-ddTHH:mmzzz', [Globalization.CultureInfo]::InvariantCulture).UtcDateTime
 }
 
+function Convert-LocalClockToMinutes {
+    param([Parameter(Mandatory)][string]$Value)
+    if ($Value -eq '24:00') { return 1440 }
+    try { $parsed = [TimeSpan]::ParseExact($Value, 'hh\:mm', [Globalization.CultureInfo]::InvariantCulture) }
+    catch { throw 'M6_LOCAL_CLOCK_INVALID' }
+    return [int]$parsed.TotalMinutes
+}
+
 function Read-SealedManifest {
     param([Parameter(Mandatory)][string]$Root)
     $root = Assert-RegularDirectory -Path $Root -Code 'M6_CERTIFICATION_DIRECTORY_INVALID'
@@ -157,7 +166,8 @@ function Assert-FrozenInputs {
         @($Manifest.candidate.binary_path, $Manifest.candidate.binary_sha256, 'M6_CANDIDATE_BINARY_CHANGED'),
         @($Manifest.candidate.release_manifest_path, $Manifest.candidate.release_manifest_sha256, 'M6_RELEASE_MANIFEST_CHANGED'),
         @($Manifest.configuration.path, $Manifest.configuration.sha256, 'M6_CONFIG_CHANGED'),
-        @($Manifest.tool.path, $Manifest.tool.sha256, 'M6_CERTIFICATION_TOOL_CHANGED')
+        @($Manifest.tool.path, $Manifest.tool.sha256, 'M6_CERTIFICATION_TOOL_CHANGED'),
+        @($Manifest.media_publisher.tool_path, $Manifest.media_publisher.tool_sha256, 'M6_MEDIA_PUBLISHER_TOOL_CHANGED')
     )
     foreach ($check in $checks) {
         if (-not (Test-Path -LiteralPath $check[0] -PathType Leaf) -or (Get-SHA256 -Path $check[0]) -ne $check[1]) { throw $check[2] }
@@ -195,6 +205,16 @@ function Read-CertificationRecords {
         foreach ($line in Get-Content -Encoding UTF8 -LiteralPath $path) { if ($line.Trim()) { $records += ($line | ConvertFrom-Json) } }
     }
     return $records
+}
+
+function Read-MediaPublisherRuns {
+    param([Parameter(Mandatory)]$Manifest)
+    $runs = @()
+    $directory = Join-Path $Manifest.paths.certification_directory 'media-publisher'
+    foreach ($file in @(Get-ChildItem -LiteralPath $directory -File -Filter '*.json' -ErrorAction SilentlyContinue)) {
+        $runs += Read-JsonFile -Path $file.FullName -Code 'M6_MEDIA_PUBLISHER_RECORD_INVALID'
+    }
+    return $runs
 }
 
 function Get-CoverageSegments {
@@ -302,6 +322,10 @@ function Invoke-Initialize {
     foreach ($exercise in @($profile.planned_exercises)) {
         if ([string]::IsNullOrWhiteSpace([string]$exercise.rto_key) -or $null -eq $profile.recovery_rto_seconds.([string]$exercise.rto_key)) { throw "M6_PROFILE_EXERCISE_RTO_INVALID:$($exercise.kind)" }
     }
+    $publisherProfile = $profile.media_publisher
+    if ($null -eq $publisherProfile -or [string]::IsNullOrWhiteSpace([string]$publisherProfile.device_name) -or [string]$publisherProfile.device_name -match '["\r\n]' -or [string]::IsNullOrWhiteSpace([string]$publisherProfile.collector_id)) { throw 'M6_MEDIA_PUBLISHER_PROFILE_INVALID' }
+    if ([int]$publisherProfile.segment_seconds -lt 1 -or [int]$publisherProfile.segment_seconds -gt 600 -or [int]$publisherProfile.segment_count -lt 1 -or [int]$publisherProfile.segment_count -gt 12 -or [int]$publisherProfile.clock_error_ms -lt 0 -or [int]$publisherProfile.acceptance_timeout_seconds -lt 5 -or [int]$publisherProfile.acceptance_timeout_seconds -gt 600) { throw 'M6_MEDIA_PUBLISHER_PROFILE_INVALID' }
+    [void](Convert-LocalClockToMinutes -Value ([string]$publisherProfile.daily_start_local))
 
     $repositoryStatus = @(& git -C $sourceRepoRoot status --porcelain=v1 --untracked-files=all)
     if ($LASTEXITCODE -ne 0 -or $repositoryStatus.Count -ne 0) { throw 'M6_REPOSITORY_NOT_CLEAN' }
@@ -335,6 +359,22 @@ function Invoke-Initialize {
         $source = Invoke-LocalJson -Uri ($base.AbsoluteUri.TrimEnd('/') + "/api/0/buckets/$bucket") -Code "M6_ACTIVITYWATCH_UNAVAILABLE:$($collector.id)"
         if ([string]$source.id -ne [string]$collector.activitywatch.bucket_id) { throw "M6_ACTIVITYWATCH_BUCKET_MISMATCH:$($collector.id)" }
     }
+    $publisherCollector = @($media | Where-Object { $_.id -eq [string]$publisherProfile.collector_id })
+    if ($publisherCollector.Count -ne 1) { throw 'M6_MEDIA_PUBLISHER_COLLECTOR_INVALID' }
+    $publisherStartMinutes = Convert-LocalClockToMinutes -Value ([string]$publisherProfile.daily_start_local)
+    $publisherDurationSeconds = [int]$publisherProfile.segment_seconds * [int]$publisherProfile.segment_count
+    $allDays = @('monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday', 'sunday')
+    $publisherWindows = @($publisherCollector[0].planned_schedule.windows | Where-Object {
+        $window = $_
+        $windowStart = Convert-LocalClockToMinutes -Value ([string]$window.start_local)
+        $windowEnd = Convert-LocalClockToMinutes -Value ([string]$window.end_local)
+        @($allDays | Where-Object { @($window.days) -notcontains $_ }).Count -eq 0 -and $windowStart -eq $publisherStartMinutes -and (($windowEnd - $windowStart) * 60) -eq $publisherDurationSeconds
+    })
+    if ($publisherWindows.Count -ne 1) { throw 'M6_MEDIA_PUBLISHER_SCHEDULE_MISMATCH' }
+    $ffmpeg = Assert-RegularFile -Path ([string]$publisherProfile.ffmpeg_path) -Code 'M6_FFMPEG_INVALID'
+    $ffmpegLine = ((& $ffmpeg -version | Select-Object -First 1) | Out-String).Trim()
+    if ($LASTEXITCODE -ne 0 -or $ffmpegLine -notmatch "^ffmpeg version $([regex]::Escape($requiredFFmpegVersion))\b") { throw 'M6_FFMPEG_VERSION_MISMATCH' }
+    $publisherSource = Assert-RegularFile -Path (Join-Path $sourceRepoRoot 'scripts\m6-desk-media.ps1') -Code 'M6_MEDIA_PUBLISHER_TOOL_MISSING'
 
     $releaseDirectory = Split-Path -Parent $binary
     $appRoot = Split-Path -Parent (Split-Path -Parent $releaseDirectory)
@@ -366,9 +406,14 @@ function Invoke-Initialize {
     if ($LASTEXITCODE -ne 0) { throw 'M6_PREFLIGHT_FAULT_INJECTION_FAILED' }
 
     [void](New-Item -ItemType Directory -Path $certificationRoot)
-    foreach ($name in @('samples', 'daily', 'backups', 'records', 'preflight', 'tool', 'state')) { [void](New-Item -ItemType Directory -Path (Join-Path $certificationRoot $name)) }
+    foreach ($name in @('samples', 'daily', 'backups', 'records', 'preflight', 'tool', 'state', 'media-publisher')) { [void](New-Item -ItemType Directory -Path (Join-Path $certificationRoot $name)) }
     $frozenTool = Join-Path $certificationRoot 'tool\m6-certification.ps1'
+    $frozenPublisher = Join-Path $certificationRoot 'tool\m6-desk-media.ps1'
     Copy-Item -LiteralPath $PSCommandPath -Destination $frozenTool
+    Copy-Item -LiteralPath $publisherSource -Destination $frozenPublisher
+    $publisherPlanOutput = @(& $publisherSource -InboxDirectory $configCheck.media_inbox_directory -FFmpegPath $ffmpeg -ExpectedFFmpegSHA256 (Get-SHA256 -Path $ffmpeg) -DeviceName $publisherProfile.device_name -StateDirectory (Join-Path $certificationRoot 'media-publisher') -CollectorID $publisherProfile.collector_id -SegmentSeconds $publisherProfile.segment_seconds -SegmentCount $publisherProfile.segment_count -ClockErrorMS $publisherProfile.clock_error_ms -AcceptanceTimeoutSeconds $publisherProfile.acceptance_timeout_seconds -PlanOnly)
+    $publisherPlan = (($publisherPlanOutput | Out-String).Trim() | ConvertFrom-Json)
+    Write-JsonAtomic -Path (Join-Path $certificationRoot 'preflight\media-publisher-plan.json') -Value $publisherPlan
     $startLocalDate = [DateTime]::UtcNow.AddHours(8).Date.AddDays(1)
     $startUTC = Convert-IsoLocalToUtc -LocalText $startLocalDate.ToString('yyyy-MM-ddT00:00') -Offset $profile.utc_offset
     $endUTC = $startUTC.AddDays(14)
@@ -414,11 +459,17 @@ function Invoke-Initialize {
             storage = $configRaw.storage; operations = $configRaw.operations; retention = $configRaw.retention
         }
         collectors = $collectors; dependencies = $dependencies; vendor_tree_sha256 = Get-DependencyTreeHash -Root (Join-Path $sourceRepoRoot 'vendor')
+        media_publisher = [ordered]@{
+            tool_path = $frozenPublisher; tool_sha256 = Get-SHA256 -Path $frozenPublisher; ffmpeg_path = $ffmpeg; ffmpeg_sha256 = Get-SHA256 -Path $ffmpeg; ffmpeg_version = $requiredFFmpegVersion
+            device_name = $publisherProfile.device_name; collector_id = $publisherProfile.collector_id; daily_start_local = $publisherProfile.daily_start_local
+            segment_seconds = [int]$publisherProfile.segment_seconds; segment_count = [int]$publisherProfile.segment_count
+            clock_error_ms = [int64]$publisherProfile.clock_error_ms; acceptance_timeout_seconds = [int]$publisherProfile.acceptance_timeout_seconds
+        }
         limits = $profile.limits; backup = [ordered]@{ directory = $backupRoot; rpo_hours = $profile.backup_rpo_hours; media_sample_count = $profile.media_sample_count }
         recovery_rto_seconds = $profile.recovery_rto_seconds; planned_exercises = $planned
         automation = [ordered]@{ sample_interval_minutes = $profile.sample_interval_minutes; backup_local_time = '00:10'; daily_local_time = '01:00'; backup_schedule_tolerance_seconds = 300 }
         paths = [ordered]@{ repository_root = $sourceRepoRoot; app_root = $appRoot; certification_directory = $certificationRoot; backup_directory = $backupRoot }
-        tasks = [ordered]@{ sample = "ExamMonitor M6 Sample $($release.version)"; backup = "ExamMonitor M6 Backup $($release.version)"; daily = "ExamMonitor M6 Daily $($release.version)" }
+        tasks = [ordered]@{ sample = "ExamMonitor M6 Sample $($release.version)"; media = "ExamMonitor M6 Desk Media $($release.version)"; backup = "ExamMonitor M6 Backup $($release.version)"; daily = "ExamMonitor M6 Daily $($release.version)" }
         environment = [ordered]@{ machine = $env:COMPUTERNAME; user = [Security.Principal.WindowsIdentity]::GetCurrent().Name; os = [Environment]::OSVersion.VersionString; powershell = $PSVersionTable.PSVersion.ToString() }
         tool = [ordered]@{ path = $frozenTool; sha256 = Get-SHA256 -Path $frozenTool }
     }
@@ -449,15 +500,23 @@ function Invoke-InstallTasks {
     $command = [Security.SecurityElement]::Escape($PSHOME + '\powershell.exe')
     $tool = [Security.SecurityElement]::Escape([string]$Manifest.tool.path)
     $root = [Security.SecurityElement]::Escape([string]$Manifest.paths.certification_directory)
+    $publisherTool = [Security.SecurityElement]::Escape([string]$Manifest.media_publisher.tool_path)
+    $publisherInbox = [Security.SecurityElement]::Escape([string]$Manifest.configuration.media_inbox_directory)
+    $publisherFFmpeg = [Security.SecurityElement]::Escape([string]$Manifest.media_publisher.ffmpeg_path)
+    $publisherDevice = [Security.SecurityElement]::Escape([string]$Manifest.media_publisher.device_name)
+    $publisherState = [Security.SecurityElement]::Escape((Join-Path $Manifest.paths.certification_directory 'media-publisher'))
+    $publisherCollector = [Security.SecurityElement]::Escape([string]$Manifest.media_publisher.collector_id)
     $start = [DateTime]::Now.AddMinutes(1).ToString('s')
     $certificationStartLocal = [DateTime]::Parse([string]$Manifest.starts_at_utc).ToUniversalTime().AddHours(8)
     $backupStart = $certificationStartLocal.Date.AddMinutes(10).ToString('s')
+    $mediaStart = $certificationStartLocal.Date.AddMinutes((Convert-LocalClockToMinutes -Value ([string]$Manifest.media_publisher.daily_start_local))).ToString('s')
     $dailyStart = $certificationStartLocal.Date.AddDays(1).AddHours(1).ToString('s')
     $sampleMinutes = [int]$Manifest.automation.sample_interval_minutes
     $tasks = @(
-        [ordered]@{ name = $Manifest.tasks.sample; limit = 'PT5M'; trigger = "<CalendarTrigger><StartBoundary>$start</StartBoundary><Enabled>true</Enabled><Repetition><Interval>PT${sampleMinutes}M</Interval><StopAtDurationEnd>false</StopAtDurationEnd></Repetition></CalendarTrigger>"; action = "-NoProfile -NonInteractive -ExecutionPolicy Bypass -File &quot;$tool&quot; -Action Sample -CertificationDirectory &quot;$root&quot;" },
-        [ordered]@{ name = $Manifest.tasks.backup; limit = 'PT45M'; trigger = "<CalendarTrigger><StartBoundary>$backupStart</StartBoundary><Enabled>true</Enabled><ScheduleByDay><DaysInterval>1</DaysInterval></ScheduleByDay></CalendarTrigger>"; action = "-NoProfile -NonInteractive -ExecutionPolicy Bypass -File &quot;$tool&quot; -Action Backup -CertificationDirectory &quot;$root&quot;" },
-        [ordered]@{ name = $Manifest.tasks.daily; limit = 'PT45M'; trigger = "<CalendarTrigger><StartBoundary>$dailyStart</StartBoundary><Enabled>true</Enabled><ScheduleByDay><DaysInterval>1</DaysInterval></ScheduleByDay></CalendarTrigger>"; action = "-NoProfile -NonInteractive -ExecutionPolicy Bypass -File &quot;$tool&quot; -Action Daily -CertificationDirectory &quot;$root&quot;" }
+        [ordered]@{ name = $Manifest.tasks.sample; limit = 'PT5M'; start_when_available = 'true'; trigger = "<TimeTrigger><StartBoundary>$start</StartBoundary><Repetition><Interval>PT${sampleMinutes}M</Interval></Repetition></TimeTrigger>"; action = "-NoProfile -NonInteractive -ExecutionPolicy Bypass -File &quot;$tool&quot; -Action Sample -CertificationDirectory &quot;$root&quot;" },
+        [ordered]@{ name = $Manifest.tasks.media; limit = 'PT45M'; start_when_available = 'false'; trigger = "<CalendarTrigger><StartBoundary>$mediaStart</StartBoundary><Enabled>true</Enabled><ScheduleByDay><DaysInterval>1</DaysInterval></ScheduleByDay></CalendarTrigger>"; action = "-NoProfile -NonInteractive -ExecutionPolicy Bypass -File &quot;$publisherTool&quot; -InboxDirectory &quot;$publisherInbox&quot; -FFmpegPath &quot;$publisherFFmpeg&quot; -ExpectedFFmpegSHA256 $($Manifest.media_publisher.ffmpeg_sha256) -DeviceName &quot;$publisherDevice&quot; -StateDirectory &quot;$publisherState&quot; -CollectorID &quot;$publisherCollector&quot; -SegmentSeconds $([int]$Manifest.media_publisher.segment_seconds) -SegmentCount $([int]$Manifest.media_publisher.segment_count) -ClockErrorMS $([int64]$Manifest.media_publisher.clock_error_ms) -AcceptanceTimeoutSeconds $([int]$Manifest.media_publisher.acceptance_timeout_seconds)" },
+        [ordered]@{ name = $Manifest.tasks.backup; limit = 'PT45M'; start_when_available = 'true'; trigger = "<CalendarTrigger><StartBoundary>$backupStart</StartBoundary><Enabled>true</Enabled><ScheduleByDay><DaysInterval>1</DaysInterval></ScheduleByDay></CalendarTrigger>"; action = "-NoProfile -NonInteractive -ExecutionPolicy Bypass -File &quot;$tool&quot; -Action Backup -CertificationDirectory &quot;$root&quot;" },
+        [ordered]@{ name = $Manifest.tasks.daily; limit = 'PT45M'; start_when_available = 'true'; trigger = "<CalendarTrigger><StartBoundary>$dailyStart</StartBoundary><Enabled>true</Enabled><ScheduleByDay><DaysInterval>1</DaysInterval></ScheduleByDay></CalendarTrigger>"; action = "-NoProfile -NonInteractive -ExecutionPolicy Bypass -File &quot;$tool&quot; -Action Daily -CertificationDirectory &quot;$root&quot;" }
     )
     foreach ($task in $tasks) {
         $xml = @"
@@ -466,15 +525,18 @@ function Invoke-InstallTasks {
   <RegistrationInfo><Description>Exam Monitor M6 frozen certification evidence task</Description></RegistrationInfo>
   <Triggers>$($task.trigger)</Triggers>
   <Principals><Principal id="Author"><UserId>$([Security.SecurityElement]::Escape($identity))</UserId><LogonType>InteractiveToken</LogonType><RunLevel>LeastPrivilege</RunLevel></Principal></Principals>
-  <Settings><MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy><DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries><StopIfGoingOnBatteries>false</StopIfGoingOnBatteries><StartWhenAvailable>true</StartWhenAvailable><ExecutionTimeLimit>$($task.limit)</ExecutionTimeLimit><Enabled>true</Enabled></Settings>
+  <Settings><MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy><DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries><StopIfGoingOnBatteries>false</StopIfGoingOnBatteries><StartWhenAvailable>$($task.start_when_available)</StartWhenAvailable><ExecutionTimeLimit>$($task.limit)</ExecutionTimeLimit><Enabled>true</Enabled></Settings>
   <Actions Context="Author"><Exec><Command>$command</Command><Arguments>$($task.action)</Arguments></Exec></Actions>
 </Task>
 "@
         $temporary = Join-Path ([IO.Path]::GetTempPath()) ("exam-monitor-m6-task-" + [guid]::NewGuid().ToString('N') + '.xml')
         try {
             [IO.File]::WriteAllText($temporary, $xml, [Text.Encoding]::Unicode)
-            & "$env:SystemRoot\System32\schtasks.exe" /Create /TN $task.name /XML $temporary /F | Out-Null
-            if ($LASTEXITCODE -ne 0) { throw "M6_TASK_INSTALL_FAILED:$($task.name):$LASTEXITCODE" }
+            $savedPreference = $ErrorActionPreference
+            $ErrorActionPreference = 'Continue'
+            try { $taskOutput = @(& "$env:SystemRoot\System32\schtasks.exe" /Create /TN $task.name /XML $temporary /F 2>&1); $taskExit = $LASTEXITCODE }
+            finally { $ErrorActionPreference = $savedPreference }
+            if ($taskExit -ne 0) { throw "M6_TASK_INSTALL_FAILED:$($task.name):$taskExit`:$((($taskOutput | Out-String).Trim()))" }
         }
         finally { Remove-Item -LiteralPath $temporary -Force -ErrorAction SilentlyContinue }
     }
@@ -482,9 +544,12 @@ function Invoke-InstallTasks {
 
 function Invoke-RemoveTasks {
     param([Parameter(Mandatory)]$Manifest)
-    foreach ($name in @($Manifest.tasks.sample, $Manifest.tasks.backup, $Manifest.tasks.daily)) {
-        & "$env:SystemRoot\System32\schtasks.exe" /Delete /TN $name /F 2>$null | Out-Null
-        if ($LASTEXITCODE -notin @(0, 1)) { throw "M6_TASK_REMOVE_FAILED:$name`:$LASTEXITCODE" }
+    foreach ($name in @($Manifest.tasks.sample, $Manifest.tasks.media, $Manifest.tasks.backup, $Manifest.tasks.daily)) {
+        $savedPreference = $ErrorActionPreference
+        $ErrorActionPreference = 'Continue'
+        try { & "$env:SystemRoot\System32\schtasks.exe" /Delete /TN $name /F 2>&1 | Out-Null; $taskExit = $LASTEXITCODE }
+        finally { $ErrorActionPreference = $savedPreference }
+        if ($taskExit -notin @(0, 1)) { throw "M6_TASK_REMOVE_FAILED:$name`:$taskExit" }
     }
 }
 
@@ -667,6 +732,12 @@ function Invoke-Daily {
     })
     $manualInterventions = @($dayRecords | Where-Object { $_.kind -eq 'manual_intervention' })
     $notifications = @($dayRecords | Where-Object { $_.kind -eq 'notification' })
+    $publisherRuns = @(Read-MediaPublisherRuns -Manifest $Manifest | Where-Object {
+        $started = [DateTime]::Parse([string]$_.started_at_utc).ToUniversalTime()
+        $started -ge $dayStartUTC -and $started -lt $dayEndUTC
+    })
+    $publisherStartUTC = Convert-IsoLocalToUtc -LocalText "$dateText`T$($Manifest.media_publisher.daily_start_local)" -Offset '+08:00'
+    $publisherPassed = $publisherRuns.Count -eq 1 -and $publisherRuns[0].status -eq 'passed' -and [int]$publisherRuns[0].accepted_segments -eq [int]$Manifest.media_publisher.segment_count -and [DateTime]::Parse([string]$publisherRuns[0].started_at_utc).ToUniversalTime() -ge $publisherStartUTC -and [DateTime]::Parse([string]$publisherRuns[0].started_at_utc).ToUniversalTime() -lt $publisherStartUTC.AddMinutes(5)
     $crashTimes = @($samples | ForEach-Object { @($_.supervisor.crash_times_utc) } | Where-Object {
         $crash = [DateTime]::Parse([string]$_).ToUniversalTime(); $crash -ge $dayStartUTC -and $crash -lt $dayEndUTC
     } | Sort-Object -Unique)
@@ -676,7 +747,7 @@ function Invoke-Daily {
         degraded_samples = @($samples | Where-Object { $_.supervisor.status -eq 'degraded' }).Count
         system_boots = @($samples | ForEach-Object { $_.system_boot_utc } | Sort-Object -Unique)
     }
-    $dayPassed = $sampleHealth -and $resourcesPassed -and $duplicatesPassed -and $coveragePassed -and $schemaPassed -and $mediaDurationPassed -and $mediaSamplesPassed -and $backupRPOPassed -and $coreLossPassed -and $manualInterventions.Count -eq 0 -and $database.integrity -eq 'ok'
+    $dayPassed = $sampleHealth -and $resourcesPassed -and $duplicatesPassed -and $coveragePassed -and $schemaPassed -and $mediaDurationPassed -and $mediaSamplesPassed -and $publisherPassed -and $backupRPOPassed -and $coreLossPassed -and $manualInterventions.Count -eq 0 -and $database.integrity -eq 'ok'
     $previousDate = $targetDate.AddDays(-1).ToString('yyyy-MM-dd')
     $previousPath = Join-Path $root "daily\$previousDate.json"
     $baseline = if (Test-Path -LiteralPath $previousPath -PathType Leaf) { (Read-JsonFile -Path $previousPath -Code 'M6_PREVIOUS_DAILY_INVALID').database } else { Read-JsonFile -Path (Join-Path $root 'preflight\baseline-database.json') -Code 'M6_BASELINE_DATABASE_INVALID' }
@@ -705,6 +776,7 @@ function Invoke-Daily {
         confirmed_core_loss = [ordered]@{ missing_or_retention_deleted_media = $missingMedia; passed = $coreLossPassed }; supervisor = $supervisorSummary
         backup = $backup; backup_gap_seconds = if ($null -eq $backupGapSeconds) { $null } else { [int64][Math]::Round($backupGapSeconds) }; backup_rpo_passed = $backupRPOPassed
         media_samples = $mediaSamples; media_samples_passed = $mediaSamplesPassed; media_duration_passed = $mediaDurationPassed
+        media_publisher_runs = $publisherRuns; media_publisher_passed = $publisherPassed
         coverage = $coverageSummary; coverage_passed = $coveragePassed; excluded_exercise_windows = $excluded
         exercises = @($dayRecords | Where-Object { $_.kind -in $requiredExerciseKinds }); manual_interventions = $manualInterventions; notifications = $notifications
     }
@@ -799,7 +871,7 @@ function Invoke-Finalize {
             [ordered]@{
                 date_local = $_.date_local; verdict = $_.verdict; sample_count = $_.sample_count; maximum_sample_gap_seconds = $_.maximum_sample_gap_seconds
                 coverage = $_.coverage; database_integrity = $_.database.integrity; backup_gap_seconds = $_.backup_gap_seconds
-                media_samples_passed = $_.media_samples_passed; resources_passed = $_.resources_passed
+                media_samples_passed = $_.media_samples_passed; media_publisher_passed = $_.media_publisher_passed; resources_passed = $_.resources_passed
             }
         })
         evidence_count_deltas = $countTotals
@@ -845,7 +917,7 @@ catch {
         try {
             $manifest = Read-SealedManifest -Root $CertificationDirectory
             $code = if ($_.Exception.Message -match '^([A-Z0-9_]+)') { $Matches[1] } else { 'M6_CERTIFICATION_FAILED' }
-            if ($code -in @('M6_CANDIDATE_BINARY_CHANGED', 'M6_RELEASE_MANIFEST_CHANGED', 'M6_CONFIG_CHANGED', 'M6_CERTIFICATION_TOOL_CHANGED', 'M6_CURRENT_POINTER_INVALID', 'M6_ACTIVE_RELEASE_CHANGED', 'M6_REPOSITORY_CHANGED', 'M6_DEPENDENCY_CHANGED')) {
+            if ($code -in @('M6_CANDIDATE_BINARY_CHANGED', 'M6_RELEASE_MANIFEST_CHANGED', 'M6_CONFIG_CHANGED', 'M6_CERTIFICATION_TOOL_CHANGED', 'M6_MEDIA_PUBLISHER_TOOL_CHANGED', 'M6_CURRENT_POINTER_INVALID', 'M6_ACTIVE_RELEASE_CHANGED', 'M6_REPOSITORY_CHANGED', 'M6_DEPENDENCY_CHANGED')) {
                 Write-Violation -Manifest $manifest -Code $code -Detail $_.Exception.Message
             }
         }

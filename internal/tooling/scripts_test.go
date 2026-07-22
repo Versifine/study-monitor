@@ -118,7 +118,7 @@ if ($env:GOPROXY -ne $beforeProxy) { throw 'dev.ps1 did not restore GOPROXY' }
 func TestOperationalScriptsParseAsPowerShell(t *testing.T) {
 	requireOuterWindowsTest(t)
 	repository := repositoryRoot(t)
-	names := []string{"build-web.ps1", "process-control.ps1", "install.ps1", "uninstall.ps1", "run-supervised.ps1", "backup.ps1", "restore.ps1", "rollback.ps1", "smoke-m4.ps1", "fault-injection.ps1", "m6-certification.ps1"}
+	names := []string{"build-web.ps1", "process-control.ps1", "install.ps1", "uninstall.ps1", "run-supervised.ps1", "backup.ps1", "restore.ps1", "rollback.ps1", "smoke-m4.ps1", "fault-injection.ps1", "m6-certification.ps1", "m6-desk-media.ps1"}
 	quoted := make([]string, len(names))
 	for index, name := range names {
 		quoted[index] = "'" + quotePowerShell(filepath.Join(repository, "scripts", name)) + "'"
@@ -149,7 +149,17 @@ func TestM6CertificationProfileDeclaresEveryRequiredExerciseOnce(t *testing.T) {
 		BackupRPOHours        int                `json:"backup_rpo_hours"`
 		Limits                map[string]float64 `json:"limits"`
 		RecoveryRTOSeconds    map[string]int     `json:"recovery_rto_seconds"`
-		PlannedExercises      []struct {
+		MediaPublisher        struct {
+			DeviceName               string `json:"device_name"`
+			FFmpegPath               string `json:"ffmpeg_path"`
+			CollectorID              string `json:"collector_id"`
+			DailyStartLocal          string `json:"daily_start_local"`
+			SegmentSeconds           int    `json:"segment_seconds"`
+			SegmentCount             int    `json:"segment_count"`
+			ClockErrorMS             int64  `json:"clock_error_ms"`
+			AcceptanceTimeoutSeconds int    `json:"acceptance_timeout_seconds"`
+		} `json:"media_publisher"`
+		PlannedExercises []struct {
 			Kind   string `json:"kind"`
 			RTOKey string `json:"rto_key"`
 		} `json:"planned_exercises"`
@@ -170,6 +180,9 @@ func TestM6CertificationProfileDeclaresEveryRequiredExerciseOnce(t *testing.T) {
 			t.Fatalf("missing or invalid M6 RTO %q", name)
 		}
 	}
+	if profile.MediaPublisher.DeviceName == "" || !filepath.IsAbs(profile.MediaPublisher.FFmpegPath) || profile.MediaPublisher.CollectorID != "desk.media" || profile.MediaPublisher.DailyStartLocal != "20:00" || profile.MediaPublisher.SegmentSeconds != 300 || profile.MediaPublisher.SegmentCount != 3 || profile.MediaPublisher.ClockErrorMS < 0 || profile.MediaPublisher.AcceptanceTimeoutSeconds < 5 {
+		t.Fatalf("invalid M6 media publisher profile: %#v", profile.MediaPublisher)
+	}
 	counts := map[string]int{}
 	for _, exercise := range profile.PlannedExercises {
 		counts[exercise.Kind]++
@@ -182,6 +195,32 @@ func TestM6CertificationProfileDeclaresEveryRequiredExerciseOnce(t *testing.T) {
 			t.Fatalf("M6 exercise %q count=%d", name, counts[name])
 		}
 	}
+}
+
+func TestM6DeskMediaPlanValidatesFrozenInputsWithoutCapturing(t *testing.T) {
+	requireOuterWindowsTest(t)
+	repository := repositoryRoot(t)
+	root := t.TempDir()
+	inbox := filepath.Join(root, "media inbox")
+	state := filepath.Join(root, "publisher state")
+	if err := os.MkdirAll(inbox, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(state, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	ffmpeg := filepath.Join(root, "ffmpeg.exe")
+	if err := os.WriteFile(ffmpeg, []byte("fixed publisher dependency"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	wrapper := fmt.Sprintf(`
+$ffmpeg = '%s'
+$output = @(& '%s' -InboxDirectory '%s' -FFmpegPath $ffmpeg -ExpectedFFmpegSHA256 ((Get-FileHash -LiteralPath $ffmpeg -Algorithm SHA256).Hash.ToLowerInvariant()) -DeviceName 'Integrated Camera' -StateDirectory '%s' -CollectorID 'desk.media' -SegmentSeconds 300 -SegmentCount 3 -ClockErrorMS 1000 -AcceptanceTimeoutSeconds 120 -PlanOnly)
+$plan = (($output | Out-String).Trim() | ConvertFrom-Json)
+if ($plan.status -ne 'planned' -or $plan.segment_seconds -ne 300 -or $plan.segment_count -ne 3 -or $plan.collector_id -ne 'desk.media') { throw ('publisher plan mismatch: ' + ($plan | ConvertTo-Json -Compress)) }
+if (@(Get-ChildItem -LiteralPath '%s' -Force).Count -ne 0 -or @(Get-ChildItem -LiteralPath '%s' -Force).Count -ne 0) { throw 'plan-only created runtime artifacts' }
+`, quotePowerShell(ffmpeg), quotePowerShell(filepath.Join(repository, "scripts", "m6-desk-media.ps1")), quotePowerShell(inbox), quotePowerShell(state), quotePowerShell(inbox), quotePowerShell(state))
+	runPowerShell(t, writePowerShellWrapper(t, wrapper), nil)
 }
 
 func TestM6CoverageGateUsesIndependentScheduleAndStrictMediaUsability(t *testing.T) {

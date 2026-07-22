@@ -13,6 +13,7 @@ M6 认证工具已实现，但 14 天计时只有在冻结候选已安装、Acti
 - 5 分钟资源采样周期和 24 小时完整备份 RPO
 - CPU、工作集、私有内存、句柄、线程、Go 协程/堆、WAL、日志与 staging 上限
 - 核心进程、系统重启、ActivityWatch、媒体、备份恢复和回滚 RTO
+- 外部书桌媒体设备名、固定 FFmpeg、每日开始时间、5 分钟分段数和 accepted 等待上限
 - 第 2 至 12 天的预声明故障注入窗口
 
 生产配置必须同时满足：
@@ -24,9 +25,31 @@ M6 认证工具已实现，但 14 天计时只有在冻结候选已安装、Acti
 - 当前安装指向候选发布目录，上一稳定发布目录完整且版本不同
 - 候选 commit 与干净工作树 HEAD 一致，二进制、发布 manifest 和配置校验和一致
 
+书桌媒体发布器是独立的认证来源工具，不进入 Go Recorder Core，也不改变 record-only。它仅把已关闭的真实视频按“媒体、完整 sidecar、最后 ready”顺序发布到冻结 inbox；为避免分段之间因确认等待产生覆盖空隙，全部分段连续发布后再逐个等待 Core 原子写出的 `accepted.json`。媒体任务不做错过时窗后的补跑。开始前必须由用户确认摄像头已经指向书桌；不得用测试夹具或黑色视频代替真实预检。
+
+确认物理方向后，用本机忽略的 profile 做一次 10 秒真实预检：
+
+```powershell
+$profile = Get-Content -Raw -Encoding UTF8 .\configs\m6-certification.local.json | ConvertFrom-Json
+$app = Join-Path $env:LOCALAPPDATA 'ExamMonitor'
+$current = Get-Content -Raw -Encoding UTF8 (Join-Path $app 'current.json') | ConvertFrom-Json
+$production = Get-Content -Raw -Encoding UTF8 $current.config_path | ConvertFrom-Json
+$state = Join-Path $env:LOCALAPPDATA 'ExamMonitor\m6-media-preflight'
+[void](New-Item -ItemType Directory -Path $state -Force)
+$ffmpegHash = (Get-FileHash -LiteralPath $profile.media_publisher.ffmpeg_path -Algorithm SHA256).Hash.ToLowerInvariant()
+.\scripts\m6-desk-media.ps1 `
+  -InboxDirectory $production.media_ingest.inbox_directory `
+  -FFmpegPath $profile.media_publisher.ffmpeg_path `
+  -ExpectedFFmpegSHA256 $ffmpegHash `
+  -DeviceName $profile.media_publisher.device_name `
+  -StateDirectory $state `
+  -CollectorID $profile.media_publisher.collector_id `
+  -SegmentSeconds 10 -SegmentCount 1
+```
+
 ## 3. 初始化与自动任务
 
-先构建并安装候选，再执行一次初始化。初始化会复跑完整测试与冻结候选 smoke、创建完整备份并恢复到新目录、生成密封清单，然后注册当前用户的 5 分钟采样、每日 00:10 完整备份和次日 01:00 汇总任务。日报只读取日界线后的已完成备份；若备份任务缺失会立即补做，但实际备份间隔超过冻结 RPO 加 5 分钟任务调度容差时仍判失败。
+先构建并安装候选，再执行一次初始化。初始化会复跑完整测试与冻结候选 smoke、验证媒体发布器 plan、创建完整备份并恢复到新目录、生成密封清单，然后注册当前用户的 5 分钟采样、每日书桌媒体、每日 00:10 完整备份和次日 01:00 汇总任务。日报只读取日界线后的已完成备份；若备份任务缺失会立即补做，但实际备份间隔超过冻结 RPO 加 5 分钟任务调度容差时仍判失败。
 
 ```powershell
 $cert = 'D:\ExamMonitorCertification\m6-2026-07'
@@ -47,7 +70,7 @@ $previous = Get-Content -Raw -Encoding UTF8 (Join-Path $app 'previous.json') | C
 
 初始化日不计入认证。清单把开始时间固定为下一个 Asia/Shanghai 自然日 00:00，结束时间固定为 14 个完整自然日之后。运行数据只写入独立认证目录和备份目录；不进入源码、生产 Evidence 目录或 Git。
 
-任务可以非破坏性重装；认证完成后只删除三个认证任务，不删除报告、备份或 Evidence：
+任务可以非破坏性重装；认证完成后只删除四个认证任务，不删除报告、备份或 Evidence：
 
 ```powershell
 .\scripts\m6-certification.ps1 -Action InstallTasks -CertificationDirectory $cert
@@ -64,6 +87,7 @@ $previous = Get-Content -Raw -Encoding UTF8 (Join-Path $app 'previous.json') | C
 ├─ preflight/                    # 测试、故障注入、基线完整备份/恢复和数据库快照
 ├─ samples/YYYY-MM-DD.jsonl      # 5 分钟资源、API、进程、任务与文件状态
 ├─ backups/*.json                # 每次计划完整备份的时间与 manifest 索引
+├─ media-publisher/*.json        # 每日外部录制、发布和 accepted 确认证据
 ├─ daily/YYYY-MM-DD.json         # 每日完整备份、完整性、覆盖率、媒体抽样和门槛结论
 ├─ records/events.jsonl          # 故障、恢复、回滚、人工干预和通知记录
 ├─ violations.jsonl              # 任何冻结输入变化或日报硬门槛失败；存在即不得通过
@@ -77,6 +101,7 @@ $previous = Get-Content -Raw -Encoding UTF8 (Join-Path $app 'previous.json') | C
 每日覆盖报告直接查询冻结候选的 `/api/v1/coverage`：
 
 - 每个核心来源的非空计划时间必须 100% 分类
+- 每个自然日必须恰有一次冻结媒体任务成功，且 accepted 分段数等于清单值
 - 排除预声明窗口后，ActivityWatch 与书桌媒体可用覆盖都必须至少 99%
 - ActivityWatch 单次非计划 `offline + unknown` 不得超过 300 秒
 - 书桌媒体单次非计划无有效媒体不得超过 900 秒

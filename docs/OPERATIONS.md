@@ -113,7 +113,7 @@ $binary = (.\scripts\build.ps1 -OutputDirectory C:\ExamMonitorBuild | Select-Obj
 
 M4 故障矩阵可运行 `.\scripts\fault-injection.ps1`；M5 完整真实闭环由 `.\scripts\smoke.ps1` 执行，除原有恢复/回滚场景外还从候选二进制打开嵌入页面、资源和汇总，所有破坏性场景使用临时目录和唯一临时任务名。回滚 smoke 从固定提交 `89ed656` 构建真实 M3 二进制，先安装 M3 再安装候选，并在同一前向数据库上启动回滚后的 M3；不是只改版本字符串重编候选。
 
-M6 使用 `.\scripts\m6-certification.ps1` 密封候选、配置、依赖、来源 SLA、资源/RPO/RTO 和故障窗口。初始化复跑测试与冻结候选 smoke，并注册 5 分钟资源采样、每日完整备份和次日覆盖率/完整性汇总任务。在线资源样本来自进程指标、`/api/v1/operations/status` 的 Go runtime 计数和受管目录大小；每日数据库计数只读取日界线后完成的完整备份一致快照，并校验实际备份间隔。完整命令、证据目录和重新计时规则见 [`M6_CERTIFICATION.md`](M6_CERTIFICATION.md)。
+M6 使用 `.\scripts\m6-certification.ps1` 密封候选、配置、依赖、来源 SLA、外部书桌媒体发布器、资源/RPO/RTO 和故障窗口。初始化复跑测试与冻结候选 smoke，并注册 5 分钟资源采样、每日真实书桌媒体、每日完整备份和次日覆盖率/完整性汇总任务。媒体发布器独立调用固定 FFmpeg，遵循 M2 三文件协议并等待 accepted 确认，不进入 Recorder Core；在线资源样本来自进程指标、`/api/v1/operations/status` 的 Go runtime 计数和受管目录大小；每日数据库计数只读取日界线后完成的完整备份一致快照，并校验实际备份间隔。完整命令、证据目录和重新计时规则见 [`M6_CERTIFICATION.md`](M6_CERTIFICATION.md)。
 
 ## 9. 升级
 
