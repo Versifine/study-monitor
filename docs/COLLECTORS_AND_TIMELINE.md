@@ -25,7 +25,9 @@
 
 适配器不打开、写入、锁定或迁移 ActivityWatch 数据库，也不调用其 POST、PUT、PATCH 或 DELETE 接口。bucket 元数据和事件使用冻结的 JSON 字段白名单；单响应最多 8 MiB，单轮跨页累计最多估算 32 MiB/10000 个唯一事件，所有 ActivityWatch worker 共用 2 个 poll 槽，启用的 ActivityWatch 采集器最多 4 个。整轮执行预算按最短 `offline_after` 和实际 poll 波次计算；排队结束、取得槽位后才冻结本轮 `now` 和迟到截止点。每轮结束主动关闭该轮 transport 的空闲连接，请求时间、页数和每页事件数仍分别有上限。
 
-导入截止点是 `now - allowed_lateness`；只有 `timestamp + duration` 不晚于截止点的完整事件才可导入，避免读取仍可能被 ActivityWatch heartbeat 合并修改的末尾事件。若较早 tuple 仍可变，即使更晚事件已闭合也只能返回该 tuple 之前的稳定前缀，断点不得越过 deferred 事实。已保存断点前保留 `rescan_window` 重叠重扫；来源身份由 bucket 哈希和 ActivityWatch event ID 组成。相同内容重扫返回 `duplicate`，不同内容返回冲突并停止推进断点。
+导入截止点是 `now - allowed_lateness`；只有 `timestamp + duration` 不晚于截止点的完整事件才可导入，避免读取仍可能被 ActivityWatch heartbeat 合并修改的末尾事件。若较早 tuple 仍可变，即使更晚事件已闭合也只能返回该 tuple 之前的稳定前缀，断点不得越过 deferred 事实。已保存断点前保留 `rescan_window` 重叠重扫；HTTP 查询起点向前对齐 1 ms，ActivityWatch 为重叠事件保留原 ID 但裁剪时间/时长的边界副本不进入语义范围，恰好从语义边界开始的真实事件仍保留。
+
+来源基础身份由 bucket 哈希和 ActivityWatch event ID 组成。相同内容重扫返回 `duplicate`。若已写入事件随后只把 duration 单调延长，Core 保留原不可变快照，并用包含 duration 位模式的确定性 revision 幂等键追加新快照；相同 revision 重扫仍为 `duplicate`。duration 缩短，或时间戳、data、桶身份发生变化，仍作为真实冲突拒绝并停止推进断点。
 
 事件按来源时间和来源 ID 升序写入。每个成功批次提交后才单调推进 Core 内的 `(source_time_utc, source_event_id)` 断点；进程在事实提交后、断点更新前终止只会导致安全重放。分页不前进、响应损坏、积压超过 `max_pages_per_poll` 或写入失败时不越过未确认事实。
 
@@ -99,6 +101,6 @@
 
 ## 7. 固定测试和 smoke
 
-ActivityWatch 固定夹具位于 `internal/collectors/testdata/`。测试覆盖 GET-only、真实多页边界去重、分页 stalled/backlog、跨页字节预算、全局 poll 并发、整轮超时、排队后时间冻结、每轮空闲连接关闭、不得越过较早 deferred 事件、断点跨重启、事实提交与断点提交间崩溃重放、重扫、损坏响应、单来源离线隔离、心跳重复/冲突、相接和重叠区间、迟到事实、时钟前后校正、DST 原始 offset、大误差、稳定分页、源查询 `EXPLAIN QUERY PLAN` 索引和精确边界预算。
+ActivityWatch 固定夹具位于 `internal/collectors/testdata/`。测试覆盖 GET-only、真实多页边界去重、查询起点裁剪排除、duration 单调 revision/非单调拒绝、分页 stalled/backlog、跨页字节预算、全局 poll 并发、整轮超时、排队后时间冻结、每轮空闲连接关闭、不得越过较早 deferred 事件、断点跨重启、事实提交与断点提交间崩溃重放、重扫、损坏响应、单来源离线隔离、心跳重复/冲突、相接和重叠区间、迟到事实、时钟前后校正、DST 原始 offset、大误差、稳定分页、源查询 `EXPLAIN QUERY PLAN` 索引和精确边界预算。
 
 `scripts/smoke.ps1` 使用临时目录和真实二进制，复验 M1/M2 后生成通用事件、追加心跳和已接受媒体三类时间线来源，再配置一个没有事实的采集器并确认其覆盖率出现 `offline` 而不是 `confirmed_idle`。smoke 不接触真实 Evidence 或 ActivityWatch 数据。

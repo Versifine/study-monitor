@@ -41,6 +41,52 @@ type pageCursor struct {
 	LastID     int64 `json:"last_id"`
 }
 
+func (store *Store) QueryEventFamily(ctx context.Context, collectorID, baseIdempotencyKey string) ([]Event, error) {
+	prefix := baseIdempotencyKey + ":duration:"
+	rows, err := store.db.QueryContext(ctx, `
+SELECT id, collector_id, event_type, device_timestamp_raw, device_time_utc, received_at_utc,
+       clock_offset_ms, clock_error_ms, idempotency_key, payload_json, payload_hash, schema_version
+FROM raw_events
+WHERE collector_id = ?
+  AND (idempotency_key = ? OR substr(idempotency_key, 1, ?) = ?)
+ORDER BY id ASC
+LIMIT 1025`, collectorID, baseIdempotencyKey, len(prefix), prefix)
+	if err != nil {
+		return nil, classifySQLiteError(CodeQueryFailed, "query raw event family", err)
+	}
+	defer rows.Close()
+	events := make([]Event, 0)
+	for rows.Next() {
+		var event Event
+		var payload string
+		if err := rows.Scan(
+			&event.ID,
+			&event.CollectorID,
+			&event.EventType,
+			&event.DeviceTimestampRaw,
+			&event.DeviceTimeUTC,
+			&event.ReceivedAtUTC,
+			&event.ClockOffsetMS,
+			&event.ClockErrorMS,
+			&event.IdempotencyKey,
+			&payload,
+			&event.PayloadHash,
+			&event.SchemaVersion,
+		); err != nil {
+			return nil, wrap(CodeQueryFailed, "scan raw event family", err)
+		}
+		event.Payload = json.RawMessage(payload)
+		events = append(events, event)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, classifySQLiteError(CodeQueryFailed, "iterate raw event family", err)
+	}
+	if len(events) > 1024 {
+		return nil, &Error{Code: CodeQueryFailed, Err: errors.New("raw event family exceeds the fixed revision limit")}
+	}
+	return events, nil
+}
+
 func (store *Store) QueryPage(ctx context.Context, cursorText string, limit int) (Page, error) {
 	if limit < 1 || limit > store.maxPageSize {
 		return Page{}, &Error{Code: CodePageLimitInvalid, Err: errors.New("query page limit is outside the configured range")}

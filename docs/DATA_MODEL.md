@@ -106,6 +106,8 @@ M3 的 `coverage_projection_state` 保存每个采集器最近请求范围、gen
 
 ActivityWatch 断点是可更新的导入投影，不是 Evidence。每个采集器保存绑定 bucket、固定格式 UTC 来源时间、来源 event ID 和更新时间；只允许按 `(source_time_utc, source_event_id)` 单调推进。事实成功但断点尚未推进时，重启会重扫并由 `raw_events` 幂等合同去重。
 
+ActivityWatch 基础事实以 bucket 哈希和来源 event ID 作为幂等身份。来源若在基础事实写入后只单调延长 duration，不覆盖旧事实，而是以 duration 位模式派生的 revision 幂等键追加同一来源 ID 的新快照；非单调时长或其他内容漂移不得伪装成 revision。
+
 ### timeline_entries
 
 `raw_events`、`collector_heartbeats` 和 `media_segments` 的可重建统一时间线投影。每个来源事实只对应一个 `(source_type, source_id)`，保存稳定 ID、原始/UTC/接收/校正时间、时钟质量、质量标记和来源 payload。固定 9 位纳秒 UTC 文本用于稳定排序；原始设备时间仍以事实中的原字符串返回。M3 为三类来源建立校正开始/结束范围索引；SQLite 只做候选预筛，最终纳秒级半开边界在进入投影预算前精确判断。

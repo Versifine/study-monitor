@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.0.4 - M6 认证候选
+
+- ActivityWatch 同一来源 ID 在稳定后仍单调延长 duration 时，保留原始不可变快照并用确定性 revision 幂等键追加新版快照；时间戳、data、桶身份或非单调变化仍作为真实冲突拒绝。
+
 ## 1.0.3 - M6 认证候选
 
 - ActivityWatch 重扫把 HTTP 查询起点向前垫 1 ms，并排除语义起点之前保留原 ID 的裁剪副本；避免不可变 Evidence 与来源 API 的边界裁剪发生幂等冲突，同时保留恰好从语义边界开始的真实事件。

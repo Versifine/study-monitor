@@ -12,6 +12,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -397,6 +398,84 @@ func TestActivityWatchRescanSkipsEventClippedAtStartBoundary(t *testing.T) {
 	status := manager.Status(context.Background())
 	if len(status) != 1 || status[0].Status != StatusHealthy || status[0].Duplicates != 2 {
 		t.Fatalf("clipped rescan status=%#v", status)
+	}
+}
+
+func TestActivityWatchAppendsMonotonicDurationRevision(t *testing.T) {
+	var mu sync.Mutex
+	duration := 30.0
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		writer.Header().Set("Content-Type", "application/json")
+		if request.URL.Path == "/api/0/buckets/duration-revision" {
+			_, _ = writer.Write([]byte(`{"id":"duration-revision","type":"afkstatus","client":"test","hostname":"host"}`))
+			return
+		}
+		mu.Lock()
+		currentDuration := duration
+		mu.Unlock()
+		_, _ = fmt.Fprintf(writer, `[{"id":7,"timestamp":"2026-07-20T00:00:00Z","duration":%g,"data":{"status":"afk"}}]`, currentDuration)
+	}))
+	defer server.Close()
+
+	collector := testActivityWatchCollector(server.URL, "aw.revision", "duration-revision")
+	store := openCollectorStore(t, filepath.Join(t.TempDir(), "events.db"), collector)
+	defer store.Close()
+	manager := New(testCollectorConfig(t, collector), store, testCollectorLogger(t))
+	currentNow := time.Date(2026, 7, 20, 0, 10, 0, 0, time.UTC)
+	manager.now = func() time.Time { return currentNow }
+
+	manager.PollOnce(context.Background())
+	mu.Lock()
+	duration = 40
+	mu.Unlock()
+	currentNow = currentNow.Add(time.Minute)
+	manager.PollOnce(context.Background())
+	manager.PollOnce(context.Background())
+
+	page, err := store.QueryPage(context.Background(), "", 10)
+	if err != nil || len(page.Events) != 2 {
+		t.Fatalf("duration revisions=%d err=%v", len(page.Events), err)
+	}
+	durations := make([]float64, 0, 2)
+	keys := make(map[string]struct{})
+	for _, stored := range page.Events {
+		var payload activityWatchPayload
+		if err := json.Unmarshal(stored.Payload, &payload); err != nil {
+			t.Fatal(err)
+		}
+		durations = append(durations, payload.DurationSeconds)
+		keys[stored.IdempotencyKey] = struct{}{}
+	}
+	sort.Float64s(durations)
+	if len(durations) != 2 || durations[0] != 30 || durations[1] != 40 || len(keys) != 2 {
+		t.Fatalf("duration revision facts=%#v keys=%#v", durations, keys)
+	}
+	status := manager.Status(context.Background())
+	if len(status) != 1 || status[0].Status != StatusHealthy || status[0].Imported != 2 || status[0].Duplicates != 1 {
+		t.Fatalf("duration revision status=%#v", status)
+	}
+
+	mu.Lock()
+	duration = 35
+	mu.Unlock()
+	manager.PollOnce(context.Background())
+	status = manager.Status(context.Background())
+	if len(status) != 1 || status[0].Status != StatusUnavailable || status[0].ErrorCode != CodeWriteFailed {
+		t.Fatalf("non-monotonic duration revision status=%#v", status)
+	}
+	page, err = store.QueryPage(context.Background(), "", 10)
+	if err != nil || len(page.Events) != 2 {
+		t.Fatalf("non-monotonic duration changed facts: count=%d err=%v", len(page.Events), err)
+	}
+
+	mu.Lock()
+	duration = 45
+	mu.Unlock()
+	manager.PollOnce(context.Background())
+	page, err = store.QueryPage(context.Background(), "", 10)
+	status = manager.Status(context.Background())
+	if err != nil || len(page.Events) != 3 || len(status) != 1 || status[0].Status != StatusHealthy || status[0].Imported != 3 {
+		t.Fatalf("duration revision recovery: count=%d status=%#v err=%v", len(page.Events), status, err)
 	}
 }
 

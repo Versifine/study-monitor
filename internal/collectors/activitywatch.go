@@ -48,6 +48,7 @@ const (
 type Store interface {
 	AppendBatch(context.Context, []eventstore.Candidate) ([]eventstore.WriteResult, error)
 	AppendHeartbeatBatch(context.Context, []eventstore.HeartbeatCandidate) ([]eventstore.HeartbeatWriteResult, error)
+	QueryEventFamily(context.Context, string, string) ([]eventstore.Event, error)
 	LoadActivityWatchCheckpoint(context.Context, string, string) (eventstore.ActivityWatchCheckpoint, bool, error)
 	SaveActivityWatchCheckpoint(context.Context, eventstore.ActivityWatchCheckpoint) error
 }
@@ -351,6 +352,19 @@ func (manager *Manager) poll(ctx context.Context, collector config.CollectorConf
 				imported++
 			case eventstore.StatusDuplicate:
 				duplicates++
+			case eventstore.StatusConflict:
+				if result.ErrorCode != eventstore.CodeIdempotencyConflict || result.Index < 0 || result.Index >= len(candidates) {
+					return imported, duplicates, checkpoint, &adapterError{CodeWriteFailed, fmt.Errorf("ActivityWatch event write returned %s (%s)", result.Status, result.ErrorCode)}
+				}
+				revisionStatus, revisionErr := manager.appendActivityWatchDurationRevision(ctx, collector, bucket, events[offset+result.Index], result.EventID)
+				if revisionErr != nil {
+					return imported, duplicates, checkpoint, revisionErr
+				}
+				if revisionStatus == eventstore.StatusAccepted {
+					imported++
+				} else {
+					duplicates++
+				}
 			default:
 				return imported, duplicates, checkpoint, &adapterError{CodeWriteFailed, fmt.Errorf("ActivityWatch event write returned %s (%s)", result.Status, result.ErrorCode)}
 			}
@@ -371,6 +385,29 @@ func (manager *Manager) poll(ctx context.Context, collector config.CollectorConf
 		return imported, duplicates, checkpoint, err
 	}
 	return imported, duplicates, checkpoint, nil
+}
+
+func (manager *Manager) appendActivityWatchDurationRevision(ctx context.Context, collector config.CollectorConfig, bucket awBucket, event awEvent, existingEventID int64) (string, error) {
+	baseKey := activityWatchBaseKey(bucket.ID, event.sourceID)
+	family, err := manager.store.QueryEventFamily(ctx, collector.ID, baseKey)
+	if err != nil {
+		return "", &adapterError{CodeWriteFailed, err}
+	}
+	revision, err := activityWatchDurationRevisionCandidate(collector.ID, bucket, event, collector.ActivityWatch.ClockErrorMS, family, existingEventID)
+	if err != nil {
+		return "", &adapterError{CodeWriteFailed, err}
+	}
+	if err := manager.ensureCoreWritesAllowed(); err != nil {
+		return "", err
+	}
+	results, err := manager.store.AppendBatch(ctx, []eventstore.Candidate{revision})
+	if err != nil {
+		return "", &adapterError{CodeWriteFailed, err}
+	}
+	if len(results) != 1 || (results[0].Status != eventstore.StatusAccepted && results[0].Status != eventstore.StatusDuplicate) {
+		return "", &adapterError{CodeWriteFailed, errors.New("ActivityWatch duration revision was rejected")}
+	}
+	return results[0].Status, nil
 }
 
 func tupleAfter(at time.Time, id int64, checkpoint eventstore.ActivityWatchCheckpoint) bool {
@@ -532,22 +569,35 @@ func fetchEvents(ctx context.Context, client *http.Client, aw config.ActivityWat
 	return stable, nil
 }
 
+type activityWatchPayload struct {
+	BucketID        string          `json:"bucket_id"`
+	BucketType      string          `json:"bucket_type"`
+	BucketClient    string          `json:"bucket_client"`
+	BucketHostname  string          `json:"bucket_hostname"`
+	SourceEventID   int64           `json:"source_event_id"`
+	DurationSeconds float64         `json:"duration_seconds"`
+	Data            json.RawMessage `json:"data"`
+}
+
+var activityWatchPayloadFields = []string{
+	"bucket_id", "bucket_type", "bucket_client", "bucket_hostname", "source_event_id", "duration_seconds", "data",
+}
+
+func activityWatchBaseKey(bucketID string, sourceID int64) string {
+	bucketDigest := sha256.Sum256([]byte(bucketID))
+	return "activitywatch:" + hex.EncodeToString(bucketDigest[:8]) + ":" + strconv.FormatInt(sourceID, 10)
+}
+
 func activityWatchCandidate(collectorID string, bucket awBucket, event awEvent, clockErrorMS int64) (eventstore.Candidate, error) {
+	return activityWatchCandidateWithKey(collectorID, bucket, event, clockErrorMS, activityWatchBaseKey(bucket.ID, event.sourceID))
+}
+
+func activityWatchCandidateWithKey(collectorID string, bucket awBucket, event awEvent, clockErrorMS int64, key string) (eventstore.Candidate, error) {
 	data := json.RawMessage(event.Data)
-	payload, err := json.Marshal(struct {
-		BucketID        string          `json:"bucket_id"`
-		BucketType      string          `json:"bucket_type"`
-		BucketClient    string          `json:"bucket_client"`
-		BucketHostname  string          `json:"bucket_hostname"`
-		SourceEventID   int64           `json:"source_event_id"`
-		DurationSeconds float64         `json:"duration_seconds"`
-		Data            json.RawMessage `json:"data"`
-	}{bucket.ID, bucket.Type, bucket.Client, bucket.Hostname, event.sourceID, event.sourceDuration, data})
+	payload, err := json.Marshal(activityWatchPayload{bucket.ID, bucket.Type, bucket.Client, bucket.Hostname, event.sourceID, event.sourceDuration, data})
 	if err != nil {
 		return eventstore.Candidate{}, &adapterError{CodeResponseInvalid, err}
 	}
-	bucketDigest := sha256.Sum256([]byte(bucket.ID))
-	key := "activitywatch:" + hex.EncodeToString(bucketDigest[:8]) + ":" + strconv.FormatInt(event.sourceID, 10)
 	raw, err := json.Marshal(struct {
 		SchemaVersion      int             `json:"schema_version"`
 		CollectorID        string          `json:"collector_id"`
@@ -562,6 +612,56 @@ func activityWatchCandidate(collectorID string, bucket awBucket, event awEvent, 
 		return eventstore.Candidate{}, &adapterError{CodeResponseInvalid, err}
 	}
 	return eventstore.Candidate{Raw: raw}, nil
+}
+
+func activityWatchDurationRevisionCandidate(collectorID string, bucket awBucket, event awEvent, clockErrorMS int64, family []eventstore.Event, existingEventID int64) (eventstore.Candidate, error) {
+	baseKey := activityWatchBaseKey(bucket.ID, event.sourceID)
+	baseFound := false
+	baseDuration := 0.0
+	maximumDuration := -1.0
+	for _, stored := range family {
+		if stored.SchemaVersion != eventstore.EventSchemaVersion || stored.CollectorID != collectorID || stored.EventType != "activitywatch.event" || stored.DeviceTimestampRaw != event.Timestamp || stored.ClockOffsetMS != 0 || stored.ClockErrorMS != clockErrorMS {
+			return eventstore.Candidate{}, errors.New("ActivityWatch event id conflicts with stored immutable content")
+		}
+		if err := strictjson.ValidateExactRootObjectRequired(stored.Payload, 0, activityWatchPayloadFields...); err != nil {
+			return eventstore.Candidate{}, errors.New("stored ActivityWatch event payload is invalid")
+		}
+		var previous activityWatchPayload
+		if err := json.Unmarshal(stored.Payload, &previous); err != nil {
+			return eventstore.Candidate{}, errors.New("stored ActivityWatch event payload is invalid")
+		}
+		previousData, err := canonicalDataObject(previous.Data)
+		if err != nil {
+			return eventstore.Candidate{}, errors.New("stored ActivityWatch event data is invalid")
+		}
+		if previous.BucketID != bucket.ID || previous.BucketType != bucket.Type || previous.BucketClient != bucket.Client || previous.BucketHostname != bucket.Hostname || previous.SourceEventID != event.sourceID || !bytes.Equal(previousData, event.Data) {
+			return eventstore.Candidate{}, errors.New("ActivityWatch event id conflicts with stored immutable content")
+		}
+		expectedRevisionKey := baseKey + ":duration:" + strconv.FormatUint(math.Float64bits(previous.DurationSeconds), 16)
+		switch stored.IdempotencyKey {
+		case baseKey:
+			if baseFound || stored.ID != existingEventID {
+				return eventstore.Candidate{}, errors.New("ActivityWatch base event family is invalid")
+			}
+			baseFound = true
+			baseDuration = previous.DurationSeconds
+		default:
+			if !baseFound || stored.IdempotencyKey != expectedRevisionKey || previous.DurationSeconds <= maximumDuration {
+				return eventstore.Candidate{}, errors.New("ActivityWatch duration revision family is invalid")
+			}
+		}
+		if previous.DurationSeconds > maximumDuration {
+			maximumDuration = previous.DurationSeconds
+		}
+	}
+	if !baseFound {
+		return eventstore.Candidate{}, errors.New("ActivityWatch base event is missing")
+	}
+	if event.sourceDuration <= baseDuration || event.sourceDuration < maximumDuration {
+		return eventstore.Candidate{}, errors.New("ActivityWatch event id conflicts with stored immutable content")
+	}
+	revisionKey := baseKey + ":duration:" + strconv.FormatUint(math.Float64bits(event.sourceDuration), 16)
+	return activityWatchCandidateWithKey(collectorID, bucket, event, clockErrorMS, revisionKey)
 }
 
 func canonicalDataObject(raw json.RawMessage) (json.RawMessage, error) {
