@@ -202,12 +202,12 @@ func TestActivityWatchPaginationDeduplicatesBoundaryAndAdvancesStableTuple(t *te
 		calls++
 		switch calls {
 		case 1:
-			_, _ = writer.Write([]byte(`[{"id":3,"timestamp":"2026-07-20T00:08:00Z","duration":1,"data":{"app":"three"}},{"id":2,"timestamp":"2026-07-20T00:07:00Z","duration":1,"data":{"app":"two"}}]`))
+			_, _ = writer.Write([]byte(`[{"id":3,"timestamp":"2026-07-20T00:08:00Z","duration":1,"data":{"app":"three"}},{"id":2,"timestamp":"2026-07-20T00:07:00Z","duration":60,"data":{"title":"document","app":"two"}}]`))
 		case 2:
 			if got := request.URL.Query().Get("end"); got != "2026-07-20T00:07:00.000000000Z" {
 				t.Errorf("second page end=%q", got)
 			}
-			_, _ = writer.Write([]byte(`[{"id":2,"timestamp":"2026-07-20T00:07:00Z","duration":1,"data":{"app":"two"}},{"id":1,"timestamp":"2026-07-20T00:06:00Z","duration":1,"data":{"app":"one"}}]`))
+			_, _ = writer.Write([]byte(`[{"id":2,"timestamp":"2026-07-20T00:07:00Z","duration":0,"data":{"app":"two","title":"document"}},{"id":1,"timestamp":"2026-07-20T00:06:00Z","duration":1,"data":{"app":"one"}}]`))
 		default:
 			_, _ = writer.Write([]byte(`[]`))
 		}
@@ -228,6 +228,32 @@ func TestActivityWatchPaginationDeduplicatesBoundaryAndAdvancesStableTuple(t *te
 	if err != nil || !exists || checkpoint.SourceEventID != 3 || checkpoint.SourceTimeUTC != "2026-07-20T00:08:00.000000000Z" || calls != 3 {
 		t.Fatalf("paged checkpoint=%#v exists=%v calls=%d err=%v", checkpoint, exists, calls, err)
 	}
+}
+
+func TestActivityWatchPaginationStillRejectsRepeatedIDWithDifferentData(t *testing.T) {
+	var calls int
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		writer.Header().Set("Content-Type", "application/json")
+		if request.URL.Path == "/api/0/buckets/conflict" {
+			_, _ = writer.Write([]byte(`{"id":"conflict","type":"currentwindow","client":"test","hostname":"host"}`))
+			return
+		}
+		calls++
+		if calls == 1 {
+			_, _ = writer.Write([]byte(`[{"id":3,"timestamp":"2026-07-20T00:08:00Z","duration":1,"data":{"app":"three"}},{"id":2,"timestamp":"2026-07-20T00:07:00Z","duration":60,"data":{"app":"editor"}}]`))
+			return
+		}
+		_, _ = writer.Write([]byte(`[{"id":2,"timestamp":"2026-07-20T00:07:00Z","duration":0,"data":{"app":"browser"}},{"id":1,"timestamp":"2026-07-20T00:06:00Z","duration":1,"data":{"app":"one"}}]`))
+	}))
+	defer server.Close()
+	collector := testActivityWatchCollector(server.URL, "aw.conflict", "conflict")
+	collector.ActivityWatch.PageSize = 2
+	store := openCollectorStore(t, filepath.Join(t.TempDir(), "events.db"), collector)
+	defer store.Close()
+	manager := New(testCollectorConfig(t, collector), store, testCollectorLogger(t))
+	manager.now = func() time.Time { return time.Date(2026, 7, 20, 0, 10, 0, 0, time.UTC) }
+	manager.PollOnce(context.Background())
+	assertActivityWatchFailureWithoutFacts(t, store, manager, "aw.conflict", "conflict", CodeResponseInvalid)
 }
 
 func TestActivityWatchFullPageLimitFailsWithoutFactsOrCheckpoint(t *testing.T) {
@@ -279,7 +305,7 @@ func TestActivityWatchPaginationStallFailsWithoutFactsOrCheckpoint(t *testing.T)
 
 func TestActivityWatchDefersEventWhoseEndCrossesLatenessCutoff(t *testing.T) {
 	var mu sync.Mutex
-	duration := 90.0
+	duration := 30.0
 	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
 		writer.Header().Set("Content-Type", "application/json")
 		if request.URL.Path == "/api/0/buckets/mutable" {
@@ -355,7 +381,7 @@ func TestActivityWatchCheckpointNeverPassesEarlierDeferredEvent(t *testing.T) {
 	if _, exists, err := store.LoadActivityWatchCheckpoint(context.Background(), "aw.overlap", "overlap"); err != nil || exists {
 		t.Fatalf("deferred stable prefix advanced checkpoint: exists=%v err=%v", exists, err)
 	}
-	currentNow = time.Date(2026, 7, 20, 0, 11, 0, 0, time.UTC)
+	currentNow = time.Date(2026, 7, 20, 0, 11, 0, 1, time.UTC)
 	manager.PollOnce(context.Background())
 	page, err = store.QueryPage(context.Background(), "", 10)
 	if err != nil || len(page.Events) != 2 {

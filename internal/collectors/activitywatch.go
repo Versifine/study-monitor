@@ -453,15 +453,24 @@ func fetchEvents(ctx context.Context, client *http.Client, aw config.ActivityWat
 			if event.parsed.Before(start) || event.parsed.After(end) {
 				return nil, &adapterError{CodeResponseInvalid, errors.New("ActivityWatch returned an event outside the requested range")}
 			}
-			if err := validateDataObject(event.Data); err != nil {
+			canonicalData, err := canonicalDataObject(event.Data)
+			if err != nil {
 				return nil, err
 			}
+			event.Data = canonicalData
 			if event.parsed.Before(oldest) {
 				oldest = event.parsed
 			}
 			if previous, exists := seen[event.sourceID]; exists {
-				if previous.Timestamp != event.Timestamp || previous.sourceDuration != event.sourceDuration || !bytes.Equal(previous.Data, event.Data) {
+				if previous.Timestamp != event.Timestamp || !bytes.Equal(previous.Data, event.Data) {
 					return nil, &adapterError{CodeResponseInvalid, errors.New("ActivityWatch repeated an event id with different content")}
+				}
+				// ActivityWatch clips an event's duration at a page boundary and can
+				// also extend the current event between requests. Keep the longest
+				// semantically identical representation; the stable-prefix gate below
+				// still refuses an event that reaches the lateness cutoff.
+				if event.sourceDuration > previous.sourceDuration {
+					seen[event.sourceID] = *event
 				}
 			} else {
 				eventBytes := 256 + len(event.Timestamp) + len(event.Data)
@@ -501,7 +510,7 @@ func fetchEvents(ctx context.Context, client *http.Client, aw config.ActivityWat
 		// overlapping events are already closed. Once the first mutable tuple is
 		// found, stop the stable prefix so the checkpoint can never jump past it.
 		duration := time.Duration(event.sourceDuration * float64(time.Second))
-		if event.parsed.Add(duration).After(end) {
+		if !event.parsed.Add(duration).Before(end) {
 			break
 		}
 		stable = append(stable, event)
@@ -541,17 +550,21 @@ func activityWatchCandidate(collectorID string, bucket awBucket, event awEvent, 
 	return eventstore.Candidate{Raw: raw}, nil
 }
 
-func validateDataObject(raw json.RawMessage) error {
+func canonicalDataObject(raw json.RawMessage) (json.RawMessage, error) {
 	if err := strictjson.ValidateObjectKeys(raw, 0); err != nil {
-		return &adapterError{CodeResponseInvalid, errors.New("ActivityWatch event data contains duplicate keys or invalid JSON")}
+		return nil, &adapterError{CodeResponseInvalid, errors.New("ActivityWatch event data contains duplicate keys or invalid JSON")}
 	}
 	var value map[string]any
 	decoder := json.NewDecoder(bytes.NewReader(raw))
 	decoder.UseNumber()
 	if err := decoder.Decode(&value); err != nil || value == nil {
-		return &adapterError{CodeResponseInvalid, errors.New("ActivityWatch event data must be a JSON object")}
+		return nil, &adapterError{CodeResponseInvalid, errors.New("ActivityWatch event data must be a JSON object")}
 	}
-	return nil
+	canonical, err := json.Marshal(value)
+	if err != nil {
+		return nil, &adapterError{CodeResponseInvalid, errors.New("ActivityWatch event data cannot be canonicalized")}
+	}
+	return canonical, nil
 }
 
 func validActivityWatchIdentifier(value string, maximum int) bool {
