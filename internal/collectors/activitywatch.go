@@ -419,12 +419,17 @@ func fetchBucket(ctx context.Context, client *http.Client, aw config.ActivityWat
 func fetchEvents(ctx context.Context, client *http.Client, aw config.ActivityWatchConfig, start, end time.Time, eventLimit, byteBudget int) ([]awEvent, error) {
 	seen := make(map[int64]awEvent)
 	usedBytes := 0
+	// ActivityWatch clips an event that overlaps the requested start while
+	// retaining its source ID. Query just before the semantic boundary so the
+	// clipped representation remains outside the range we import; a real event
+	// that begins exactly at start is still preserved.
+	queryStart := start.UTC().Truncate(time.Millisecond).Add(-time.Millisecond)
 	pageEnd := end.UTC()
 	fullLastPage := false
 	for pageIndex := 0; pageIndex < aw.MaxPagesPerPoll; pageIndex++ {
 		endpoint, _ := url.Parse(strings.TrimSuffix(aw.BaseURL, "/") + "/api/0/buckets/" + url.PathEscape(aw.BucketID) + "/events")
 		query := endpoint.Query()
-		query.Set("start", fixedUTC(start))
+		query.Set("start", fixedUTC(queryStart))
 		query.Set("end", fixedUTC(pageEnd))
 		query.Set("limit", strconv.Itoa(aw.PageSize))
 		endpoint.RawQuery = query.Encode()
@@ -438,6 +443,7 @@ func fetchEvents(ctx context.Context, client *http.Client, aw config.ActivityWat
 		}
 		oldest := pageEnd
 		newIDs := 0
+		reachedStartBoundary := false
 		for index := range page {
 			event := &page[index]
 			if event.ID == nil || event.Duration == nil || *event.ID < 0 || math.IsNaN(*event.Duration) || math.IsInf(*event.Duration, 0) || *event.Duration < 0 || *event.Duration > 366*24*60*60 {
@@ -450,7 +456,7 @@ func fetchEvents(ctx context.Context, client *http.Client, aw config.ActivityWat
 				return nil, &adapterError{CodeResponseInvalid, errors.New("ActivityWatch event timestamp is invalid")}
 			}
 			event.parsed = parsed.UTC()
-			if event.parsed.Before(start) || event.parsed.After(end) {
+			if event.parsed.Before(queryStart) || event.parsed.After(end) {
 				return nil, &adapterError{CodeResponseInvalid, errors.New("ActivityWatch returned an event outside the requested range")}
 			}
 			canonicalData, err := canonicalDataObject(event.Data)
@@ -460,6 +466,10 @@ func fetchEvents(ctx context.Context, client *http.Client, aw config.ActivityWat
 			event.Data = canonicalData
 			if event.parsed.Before(oldest) {
 				oldest = event.parsed
+			}
+			if event.parsed.Before(start) {
+				reachedStartBoundary = true
+				continue
 			}
 			if previous, exists := seen[event.sourceID]; exists {
 				if previous.Timestamp != event.Timestamp || !bytes.Equal(previous.Data, event.Data) {
@@ -483,6 +493,10 @@ func fetchEvents(ctx context.Context, client *http.Client, aw config.ActivityWat
 			}
 		}
 		fullLastPage = len(page) == aw.PageSize
+		if reachedStartBoundary {
+			fullLastPage = false
+			break
+		}
 		if !fullLastPage {
 			break
 		}

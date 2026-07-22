@@ -351,6 +351,55 @@ func TestActivityWatchDefersEventWhoseEndCrossesLatenessCutoff(t *testing.T) {
 	}
 }
 
+func TestActivityWatchRescanSkipsEventClippedAtStartBoundary(t *testing.T) {
+	originalStart := time.Date(2026, 7, 19, 23, 59, 30, 0, time.UTC)
+	originalEnd := originalStart.Add(time.Minute)
+	exactBoundary := time.Date(2026, 7, 20, 0, 0, 0, 0, time.UTC)
+	laterStart := time.Date(2026, 7, 20, 1, 0, 0, 0, time.UTC)
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		writer.Header().Set("Content-Type", "application/json")
+		if request.URL.Path == "/api/0/buckets/clipped-start" {
+			_, _ = writer.Write([]byte(`{"id":"clipped-start","type":"currentwindow","client":"test","hostname":"host"}`))
+			return
+		}
+		start, err := time.Parse(time.RFC3339Nano, request.URL.Query().Get("start"))
+		if err != nil {
+			t.Errorf("invalid request start: %v", err)
+			writer.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		firstStart := originalStart
+		firstDuration := originalEnd.Sub(originalStart).Seconds()
+		if start.After(originalStart) {
+			firstStart = start
+			firstDuration = originalEnd.Sub(start).Seconds()
+		}
+		_, _ = fmt.Fprintf(writer, `[{"id":2,"timestamp":%q,"duration":1,"data":{"app":"later"}},{"id":3,"timestamp":%q,"duration":1,"data":{"app":"exact"}},{"id":1,"timestamp":%q,"duration":%g,"data":{"app":"long"}}]`, laterStart.Format(time.RFC3339Nano), exactBoundary.Format(time.RFC3339Nano), firstStart.Format(time.RFC3339Nano), firstDuration)
+	}))
+	defer server.Close()
+
+	collector := testActivityWatchCollector(server.URL, "aw.clipped", "clipped-start")
+	collector.ActivityWatch.InitialLookback = "2h"
+	collector.ActivityWatch.RescanWindow = "1h"
+	store := openCollectorStore(t, filepath.Join(t.TempDir(), "events.db"), collector)
+	defer store.Close()
+	manager := New(testCollectorConfig(t, collector), store, testCollectorLogger(t))
+	currentNow := time.Date(2026, 7, 20, 1, 2, 0, 0, time.UTC)
+	manager.now = func() time.Time { return currentNow }
+
+	manager.PollOnce(context.Background())
+	currentNow = currentNow.Add(time.Minute)
+	manager.PollOnce(context.Background())
+	page, err := store.QueryPage(context.Background(), "", 10)
+	if err != nil || len(page.Events) != 3 {
+		t.Fatalf("clipped rescan changed facts: count=%d err=%v", len(page.Events), err)
+	}
+	status := manager.Status(context.Background())
+	if len(status) != 1 || status[0].Status != StatusHealthy || status[0].Duplicates != 2 {
+		t.Fatalf("clipped rescan status=%#v", status)
+	}
+}
+
 func TestActivityWatchCheckpointNeverPassesEarlierDeferredEvent(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
 		writer.Header().Set("Content-Type", "application/json")
