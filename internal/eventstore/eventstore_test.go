@@ -27,7 +27,7 @@ func TestOpenMigratesNewDatabaseAndReopensIdempotently(t *testing.T) {
 		t.Fatalf("schema version = %d, want %d", schemaVersion, CurrentSchemaVersion)
 	}
 	var journalMode string
-	var foreignKeys, busyTimeout, migrationCount, mediaMigrationCount, m3MigrationCount int
+	var foreignKeys, busyTimeout, migrationCount, mediaMigrationCount, m3MigrationCount, m4MigrationCount int
 	if err := store.db.QueryRow("PRAGMA journal_mode").Scan(&journalMode); err != nil {
 		t.Fatal(err)
 	}
@@ -46,8 +46,11 @@ func TestOpenMigratesNewDatabaseAndReopensIdempotently(t *testing.T) {
 	if err := store.db.QueryRow("SELECT COUNT(*) FROM m3_schema_migrations").Scan(&m3MigrationCount); err != nil {
 		t.Fatal(err)
 	}
-	if journalMode != "wal" || foreignKeys != 1 || busyTimeout != 5000 || migrationCount != 1 || mediaMigrationCount != 2 || m3MigrationCount != 1 {
-		t.Fatalf("pragmas/migrations = journal:%s foreign:%d busy:%d core:%d media:%d m3:%d", journalMode, foreignKeys, busyTimeout, migrationCount, mediaMigrationCount, m3MigrationCount)
+	if err := store.db.QueryRow("SELECT COUNT(*) FROM m4_schema_migrations").Scan(&m4MigrationCount); err != nil {
+		t.Fatal(err)
+	}
+	if journalMode != "wal" || foreignKeys != 1 || busyTimeout != 5000 || migrationCount != 1 || mediaMigrationCount != 2 || m3MigrationCount != 1 || m4MigrationCount != 1 {
+		t.Fatalf("pragmas/migrations = journal:%s foreign:%d busy:%d core:%d media:%d m3:%d m4:%d", journalMode, foreignKeys, busyTimeout, migrationCount, mediaMigrationCount, m3MigrationCount, m4MigrationCount)
 	}
 	if err := store.Close(); err != nil {
 		t.Fatal(err)
@@ -101,6 +104,15 @@ func TestEmbeddedMigrationBytesHaveStableLineEndings(t *testing.T) {
 	for _, item := range m3Migrations {
 		if strings.Contains(item.contents, "\r\n") {
 			t.Fatalf("M3 migration %s contains CRLF; checksum must not depend on Windows checkout conversion", item.name)
+		}
+	}
+	m4Migrations, err := repositoryM4Migrations()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, item := range m4Migrations {
+		if strings.Contains(item.contents, "\r\n") {
+			t.Fatalf("M4 migration %s contains CRLF", item.name)
 		}
 	}
 }

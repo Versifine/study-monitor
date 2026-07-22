@@ -79,6 +79,26 @@ try {
         throw "built binary version metadata mismatch: $versionJSON"
     }
 
+	$binarySHA256 = (Get-FileHash -LiteralPath $binaryPath -Algorithm SHA256).Hash.ToLowerInvariant()
+	$manifest = [ordered]@{
+		schema_version = 1
+		version = $Version
+		commit = $commit
+		build_time_utc = $buildTime
+		platform = 'windows/amd64'
+		binary = [ordered]@{ name = 'exam-monitor.exe'; sha256 = $binarySHA256 }
+		config_schema = [ordered]@{ minimum = 1; maximum = 1 }
+		database_schema = [ordered]@{
+			core = [ordered]@{ minimum = 1; maximum = 1 }
+			media = [ordered]@{ minimum = 2; maximum = 2 }
+			m3 = [ordered]@{ minimum = 1; maximum = 1 }
+			m4 = [ordered]@{ minimum = 0; maximum = 1 }
+		}
+	}
+	$manifestPath = Join-Path $OutputDirectory 'release-manifest.json'
+	[IO.File]::WriteAllText($manifestPath, ($manifest | ConvertTo-Json -Depth 8), (New-Object Text.UTF8Encoding($false)))
+
+	Write-Output $manifestPath
     Write-Output $binaryPath
 }
 finally {

@@ -18,7 +18,10 @@
   },
   "storage": {
     "busy_timeout": "5s",
-    "max_open_connections": 8
+    "max_open_connections": 8,
+    "warning_free_bytes": 10737418240,
+    "critical_free_bytes": 5368709120,
+    "database_reserve_bytes": 1073741824
   },
   "api": {
     "max_request_bytes": 1048576,
@@ -114,7 +117,25 @@
     "max_query_range": "744h",
     "max_projection_facts": 100000
   },
+	"operations": {
+		"disk_check_interval": "30s",
+		"wal_checkpoint_interval": "5m",
+		"wal_max_bytes": 67108864,
+		"temp_cleanup_interval": "1h",
+		"temp_max_age": "24h",
+		"temp_max_files": 1000
+	},
+	"retention": {
+		"enabled": false,
+		"scan_interval": "1h",
+		"minimum_age": "168h",
+		"require_full_backup": true,
+		"max_deletes_per_run": 100
+	},
   "logging": {
-    "level": "info"
+	"level": "info",
+	"file_enabled": true,
+	"max_file_bytes": 10485760,
+	"max_files": 5
   }
 }

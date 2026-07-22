@@ -47,6 +47,16 @@
 | 应用回滚不兼容 | 当前数据和两个应用版本 | 安全拒绝，进入 Minimum mode | `rollback_blocked` |
 | 后续分析/云端失败 | 所有 Evidence | 分析关闭或积压；Recorder Core 不受影响 | `disabled`/`backlogged` |
 
+## M4 可执行故障事实
+
+- `fault_events` 追加保存模块、P0-P3、`active/recovered/degraded/disabled`、稳定错误码、有限详情和 UTC 时间。
+- `module_state_events` 追加保存可选模块的 `healthy/degraded/disabled/unavailable` 及原因；自动保留默认以 `RETENTION_DISABLED` 登记。
+- 存储从预警/关键/保留水位恢复到正常时追加 `STORAGE_DISK_RECOVERED`，不覆盖旧故障。
+- 监督进程跨启动保存崩溃时间窗；超过阈值写本地 `state/supervisor-state.json` 的 `SUPERVISOR_CRASH_LOOP`，Task Scheduler 与监督层都不会无限重启。
+- 媒体在磁盘预警及以上返回 `MEDIA_STORAGE_PROTECTED`；每个候选、每个 1 MiB 复制块和原子改名前都直接刷新系统可用空间，保留来源/暂存未确认数据。数据库保留空间受威胁时，HTTP 与 ActivityWatch/媒体元数据在实际提交前同样实时探测并停止确认，API 返回 HTTP 507；30 秒后台扫描只负责周期状态和故障事实，不是提交门控的数据源。
+- 覆盖率失败只在状态转移时追加 degraded 故障和模块状态，后续成功追加 `COVERAGE_RECOVERED`/healthy；权威事实和其他读取不受投影失败影响。
+- 保留删除先追加 `planned`；文件删除后，`deleted`、媒体 `retention_deleted` 和投影在同一事务提交。事务失败仍保持可重试的 `planned`，普通缺失不能伪装成保留删除。
+
 ## 必须接受的简单替代
 
 - 视觉分析关闭后只保存视频

@@ -106,6 +106,57 @@ if ($env:GOPROXY -ne $beforeProxy) { throw 'dev.ps1 did not restore GOPROXY' }
 	runPowerShell(t, wrapper, nil)
 }
 
+func TestM4OperationalScriptsParseAsPowerShell(t *testing.T) {
+	requireOuterWindowsTest(t)
+	repository := repositoryRoot(t)
+	names := []string{"process-control.ps1", "install.ps1", "uninstall.ps1", "run-supervised.ps1", "backup.ps1", "restore.ps1", "rollback.ps1", "smoke-m4.ps1", "fault-injection.ps1"}
+	quoted := make([]string, len(names))
+	for index, name := range names {
+		quoted[index] = "'" + quotePowerShell(filepath.Join(repository, "scripts", name)) + "'"
+	}
+	wrapper := writePowerShellWrapper(t, fmt.Sprintf(`
+$ErrorActionPreference = 'Stop'
+$failed = @()
+foreach ($path in @(%s)) {
+    $tokens = $null
+    $errors = $null
+    [void][Management.Automation.Language.Parser]::ParseFile($path, [ref]$tokens, [ref]$errors)
+    if ($errors.Count -ne 0) { $failed += "${path}: $($errors -join '; ')" }
+}
+if ($failed.Count -ne 0) { throw ($failed -join [Environment]::NewLine) }
+`, strings.Join(quoted, ",")))
+	runPowerShell(t, wrapper, nil)
+}
+
+func TestProcessControlIgnoresStaleSupervisorIdentity(t *testing.T) {
+	requireOuterWindowsTest(t)
+	repository := repositoryRoot(t)
+	appRoot := filepath.Join(t.TempDir(), "app root")
+	if err := os.MkdirAll(filepath.Join(appRoot, "state"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	wrapper := writePowerShellWrapper(t, fmt.Sprintf(`
+$ErrorActionPreference = 'Stop'
+$process = Get-Process -Id $PID
+$state = [ordered]@{
+    schema_version = 1
+    status = 'running'
+    supervisor_pid = $PID
+    supervisor_started_at_utc = $process.StartTime.ToUniversalTime().AddHours(-1).ToString('o')
+    supervisor_executable = $process.Path
+    crash_times_utc = @()
+    updated_at_utc = [DateTime]::UtcNow.ToString('o')
+}
+$statePath = '%s'
+$state | ConvertTo-Json | Set-Content -LiteralPath $statePath -Encoding UTF8
+. '%s'
+Stop-ExamMonitorManagedProcesses -AppRoot '%s' -TaskName 'ExamMonitor nonexistent stale identity test' -ErrorPrefix 'TEST'
+if ($null -eq (Get-Process -Id $PID -ErrorAction SilentlyContinue)) { throw 'stale supervisor identity killed the caller' }
+`, quotePowerShell(filepath.Join(appRoot, "state", "supervisor-state.json")), quotePowerShell(filepath.Join(repository, "scripts", "process-control.ps1")), quotePowerShell(appRoot)))
+
+	runPowerShell(t, wrapper, nil)
+}
+
 func requireOuterWindowsTest(t *testing.T) {
 	t.Helper()
 	if runtime.GOOS != "windows" {

@@ -119,6 +119,57 @@ func TestActivityWatchPollClosesPerPollIdleConnections(t *testing.T) {
 	}
 }
 
+type mutableCoreGateRecorder struct {
+	allowed atomic.Bool
+	mu      sync.Mutex
+	faults  []string
+}
+
+func (gate *mutableCoreGateRecorder) CoreWritesAllowed() (bool, string) {
+	if gate.allowed.Load() {
+		return true, ""
+	}
+	return false, "TEST_RESERVE"
+}
+
+func (gate *mutableCoreGateRecorder) RecordFault(_ context.Context, _, _, _, code, _ string) {
+	gate.mu.Lock()
+	defer gate.mu.Unlock()
+	gate.faults = append(gate.faults, code)
+}
+
+func TestActivityWatchRechecksStorageGateBeforeCommittingFetchedFacts(t *testing.T) {
+	gate := &mutableCoreGateRecorder{}
+	gate.allowed.Store(true)
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		writer.Header().Set("Content-Type", "application/json")
+		if strings.HasSuffix(request.URL.Path, "/events") {
+			gate.allowed.Store(false)
+			_, _ = writer.Write([]byte(`[{"id":1,"timestamp":"2026-07-20T00:05:00Z","duration":1,"data":{"app":"blocked"}}]`))
+			return
+		}
+		_, _ = writer.Write([]byte(`{"id":"reserve","type":"currentwindow","client":"test","hostname":"host"}`))
+	}))
+	defer server.Close()
+	collector := testActivityWatchCollector(server.URL, "aw.reserve", "reserve")
+	store := openCollectorStore(t, filepath.Join(t.TempDir(), "events.db"), collector)
+	defer store.Close()
+	manager := NewWithFaultRecorder(testCollectorConfig(t, collector), store, testCollectorLogger(t), gate)
+	manager.now = func() time.Time { return time.Date(2026, 7, 20, 0, 10, 0, 0, time.UTC) }
+	manager.PollOnce(context.Background())
+	page, err := store.QueryPage(context.Background(), "", 10)
+	if err != nil || len(page.Events) != 0 {
+		t.Fatalf("storage-protected poll committed facts=%#v err=%v", page.Events, err)
+	}
+	if _, exists, err := store.LoadActivityWatchCheckpoint(context.Background(), collector.ID, collector.ActivityWatch.BucketID); err != nil || exists {
+		t.Fatalf("storage-protected poll advanced checkpoint exists=%v err=%v", exists, err)
+	}
+	statuses := manager.Status(context.Background())
+	if len(statuses) != 1 || statuses[0].Status != StatusUnavailable || statuses[0].ErrorCode != CodeStorageProtected {
+		t.Fatalf("storage-protected status=%#v", statuses)
+	}
+}
+
 type closeTrackingTransport struct {
 	closes int32
 }

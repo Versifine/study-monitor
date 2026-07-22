@@ -38,6 +38,7 @@ const (
 	CodePaginationStalled = "ACTIVITYWATCH_PAGINATION_STALLED"
 	CodeBacklogLimit      = "ACTIVITYWATCH_BACKLOG_LIMIT"
 	CodeWriteFailed       = "ACTIVITYWATCH_WRITE_FAILED"
+	CodeStorageProtected  = "ACTIVITYWATCH_STORAGE_PROTECTED"
 
 	activityWatchPollByteBudget  = 32 << 20
 	activityWatchPollEventLimit  = 10000
@@ -50,6 +51,12 @@ type Store interface {
 	LoadActivityWatchCheckpoint(context.Context, string, string) (eventstore.ActivityWatchCheckpoint, bool, error)
 	SaveActivityWatchCheckpoint(context.Context, eventstore.ActivityWatchCheckpoint) error
 }
+
+type FaultRecorder interface {
+	RecordFault(context.Context, string, string, string, string, string)
+}
+
+type WriteGate interface{ CoreWritesAllowed() (bool, string) }
 
 type Status struct {
 	CollectorID       string `json:"collector_id"`
@@ -71,6 +78,8 @@ type Manager struct {
 	now     func() time.Time
 	client  func(time.Duration) *http.Client
 	polls   chan struct{}
+	faults  FaultRecorder
+	gate    WriteGate
 
 	pollByteBudget     int
 	pollEventLimit     int
@@ -81,6 +90,10 @@ type Manager struct {
 }
 
 func New(cfg config.Config, store Store, logger *logging.Logger) *Manager {
+	return NewWithFaultRecorder(cfg, store, logger, nil)
+}
+
+func NewWithFaultRecorder(cfg config.Config, store Store, logger *logging.Logger, faults FaultRecorder) *Manager {
 	collectors := make([]config.CollectorConfig, 0)
 	statuses := make(map[string]Status)
 	minOffline := time.Duration(0)
@@ -98,8 +111,8 @@ func New(cfg config.Config, store Store, logger *logging.Logger) *Manager {
 		waves = 1
 	}
 	executionLimit := minOffline / time.Duration(waves)
-	return &Manager{
-		configs: collectors, store: store, logger: logger, now: time.Now,
+	manager := &Manager{
+		configs: collectors, store: store, logger: logger, now: time.Now, faults: faults,
 		client:         localHTTPClient,
 		polls:          make(chan struct{}, activityWatchPollConcurrency),
 		pollByteBudget: activityWatchPollByteBudget,
@@ -109,6 +122,10 @@ func New(cfg config.Config, store Store, logger *logging.Logger) *Manager {
 		},
 		statuses: statuses,
 	}
+	if gate, ok := faults.(WriteGate); ok {
+		manager.gate = gate
+	}
+	return manager
 }
 
 func localHTTPClient(timeout time.Duration) *http.Client {
@@ -174,6 +191,14 @@ func (manager *Manager) pollAndRecord(ctx context.Context, collector config.Coll
 	var checkpoint eventstore.ActivityWatchCheckpoint
 	var err error
 	var now time.Time
+	if manager.gate != nil {
+		if gateErr := manager.ensureCoreWritesAllowed(); gateErr != nil {
+			now = manager.now().UTC()
+			err = gateErr
+			manager.recordPollStatus(ctx, collector, now, imported, duplicates, checkpoint, err)
+			return
+		}
+	}
 	select {
 	case manager.polls <- struct{}{}:
 		now = manager.now().UTC()
@@ -188,8 +213,23 @@ func (manager *Manager) pollAndRecord(ctx context.Context, collector config.Coll
 		now = manager.now().UTC()
 		err = &adapterError{CodeRequestFailed, errors.New("ActivityWatch poll could not acquire the bounded worker slot before offline_after")}
 	}
+	manager.recordPollStatus(ctx, collector, now, imported, duplicates, checkpoint, err)
+}
+
+func (manager *Manager) ensureCoreWritesAllowed() error {
+	if manager.gate == nil {
+		return nil
+	}
+	if allowed, reason := manager.gate.CoreWritesAllowed(); !allowed {
+		return &adapterError{CodeStorageProtected, fmt.Errorf("ActivityWatch import paused by storage protection: %s", reason)}
+	}
+	return nil
+}
+
+func (manager *Manager) recordPollStatus(ctx context.Context, collector config.CollectorConfig, now time.Time, imported, duplicates int, checkpoint eventstore.ActivityWatchCheckpoint, err error) {
 	manager.mu.Lock()
 	status := manager.statuses[collector.ID]
+	previousStatus, previousCode := status.Status, status.ErrorCode
 	status.LastAttemptUTC = fixedUTC(now)
 	if err != nil {
 		status.Status = StatusUnavailable
@@ -207,6 +247,11 @@ func (manager *Manager) pollAndRecord(ctx context.Context, collector config.Coll
 	manager.mu.Unlock()
 	if err != nil {
 		manager.logger.Error("activitywatch", "poll_failed", errorCode(err), "ActivityWatch collector poll failed", err, slog.String("collector_id", collector.ID))
+		if manager.faults != nil && (previousStatus != StatusUnavailable || previousCode != errorCode(err)) {
+			manager.faults.RecordFault(ctx, "activitywatch:"+collector.ID, "P2", "degraded", errorCode(err), err.Error())
+		}
+	} else if manager.faults != nil && previousStatus == StatusUnavailable && previousCode != "" {
+		manager.faults.RecordFault(ctx, "activitywatch:"+collector.ID, "P3", "recovered", "ACTIVITYWATCH_RECOVERED", "collector poll recovered")
 	}
 }
 
@@ -293,6 +338,9 @@ func (manager *Manager) poll(ctx context.Context, collector config.CollectorConf
 			}
 			candidates = append(candidates, candidate)
 		}
+		if err := manager.ensureCoreWritesAllowed(); err != nil {
+			return imported, duplicates, checkpoint, err
+		}
 		results, err := manager.store.AppendBatch(ctx, candidates)
 		if err != nil {
 			return imported, duplicates, checkpoint, &adapterError{CodeWriteFailed, err}
@@ -310,6 +358,9 @@ func (manager *Manager) poll(ctx context.Context, collector config.CollectorConf
 		last := events[end-1]
 		if !exists || tupleAfter(last.parsed, last.sourceID, checkpoint) {
 			checkpoint = eventstore.ActivityWatchCheckpoint{CollectorID: collector.ID, BucketID: aw.BucketID, SourceTimeUTC: fixedUTC(last.parsed), SourceEventID: last.sourceID}
+			if err := manager.ensureCoreWritesAllowed(); err != nil {
+				return imported, duplicates, checkpoint, err
+			}
 			if err := manager.store.SaveActivityWatchCheckpoint(ctx, checkpoint); err != nil {
 				return imported, duplicates, checkpoint, &adapterError{CodeWriteFailed, err}
 			}
@@ -328,6 +379,9 @@ func tupleAfter(at time.Time, id int64, checkpoint eventstore.ActivityWatchCheck
 }
 
 func (manager *Manager) appendPollHeartbeat(ctx context.Context, collector config.CollectorConfig, start, end time.Time) error {
+	if err := manager.ensureCoreWritesAllowed(); err != nil {
+		return err
+	}
 	if !end.After(start) {
 		end = start.Add(time.Nanosecond)
 	}

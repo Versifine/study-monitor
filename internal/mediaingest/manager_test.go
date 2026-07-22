@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -23,6 +24,25 @@ type fakeProber struct {
 	version string
 	info    ProbeInfo
 	err     error
+}
+
+type mutableStorageGate struct {
+	media atomic.Bool
+	core  atomic.Bool
+}
+
+func (gate *mutableStorageGate) MediaAllowed() (bool, string) {
+	if gate.media.Load() {
+		return true, ""
+	}
+	return false, "TEST_LOW_DISK"
+}
+
+func (gate *mutableStorageGate) CoreWritesAllowed() (bool, string) {
+	if gate.core.Load() {
+		return true, ""
+	}
+	return false, "TEST_RESERVE"
 }
 
 type mutableProber struct {
@@ -113,6 +133,36 @@ func TestManagerAcceptsReplaysAndPreservesSource(t *testing.T) {
 	summary, err = store.MediaIngestSummary(context.Background())
 	if err != nil || summary.TotalSegments != 1 {
 		t.Fatalf("summary after replay = %#v, %v", summary, err)
+	}
+}
+
+func TestCopyStopsWhenStorageGateChangesMidSegment(t *testing.T) {
+	manager, store, cfg := openTestManager(t, fakeProber{})
+	defer store.Close()
+	gate := &mutableStorageGate{}
+	gate.media.Store(true)
+	gate.core.Store(true)
+	manager.gate = gate
+	contents := []byte(strings.Repeat("large-segment-", 20000))
+	segment := writeSegment(t, cfg.MediaIngest.InboxDirectory, "low-disk-mid-copy.mp4", contents, nil)
+	manager.afterCopyChunk = func(int64) error {
+		gate.media.Store(false)
+		return nil
+	}
+	accepted, err := manager.ProcessReady(context.Background(), segment.readyPath)
+	if accepted || ErrorCode(err) != CodeStorageProtected {
+		t.Fatalf("mid-copy storage gate result accepted=%v code=%q err=%v", accepted, ErrorCode(err), err)
+	}
+	if _, err := os.Stat(segment.mediaPath); err != nil {
+		t.Fatalf("mid-copy protection lost source media: %v", err)
+	}
+	acceptedFiles, err := filepath.Glob(filepath.Join(manager.acceptedRoot, "*.media"))
+	if err != nil || len(acceptedFiles) != 0 {
+		t.Fatalf("mid-copy protection committed accepted media=%v err=%v", acceptedFiles, err)
+	}
+	summary, err := store.MediaIngestSummary(context.Background())
+	if err != nil || summary.TotalSegments != 0 {
+		t.Fatalf("mid-copy protection committed segment summary=%#v err=%v", summary, err)
 	}
 }
 

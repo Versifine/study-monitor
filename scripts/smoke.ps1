@@ -470,7 +470,8 @@ try {
     if (-not (Test-Path -LiteralPath $expectedDatabase -PathType Leaf)) {
         throw 'M2 smoke database was not created in the temporary data directory'
     }
-    Write-Output "M3 smoke passed: M1/M2 recovery plus generic Evidence, append heartbeats, multi-source timeline, and explicit offline coverage ($baseURL)"
+    & (Join-Path $PSScriptRoot 'smoke-m4.ps1') -BinaryPath $binaryPath -SourceConfigPath $configPath -SourceDataDirectory $dataDirectory
+    Write-Output "M4 smoke passed over M1-M3 compatibility: generic Evidence, media recovery, append heartbeats, unified timeline, explicit coverage, and frozen operations ($baseURL)"
 }
 catch {
     foreach ($logPath in @($firstStderr, $secondStderr)) {

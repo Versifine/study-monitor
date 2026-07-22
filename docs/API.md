@@ -90,6 +90,8 @@
 
 存储初始化失败时 `/health/live` 仍可用，但写入和查询返回存储不可用；系统不会伪造成功确认。
 
+M4 数据库保留空间受威胁时，即使 SQLite 仍可探测为可写，`/health/ready` 也返回 HTTP 503、`status=unavailable` 和 `STORAGE_DATABASE_RESERVE_THREATENED`。事件/心跳写入在读取请求体前以 HTTP 507 拒绝，表示该批次未确认，可以在空间恢复后按幂等键重试。预警和关键水位不会阻断小型核心事件；它们先暂停/拒绝媒体。
+
 ## 5. 媒体入口状态
 
 `GET|HEAD /api/v1/media/ingest/status`
@@ -130,7 +132,13 @@
 
 `projections` 为每个采集器返回 `fresh`/`stale`、generation、事实水位和错误码。单个采集器重建失败不会阻止其他采集器；失败不删除事实。覆盖率预算只统计可形成区间的 ActivityWatch、心跳和媒体事实；通用 point Evidence 保留且仍可在统一时间线查询，但不消耗覆盖率事实预算。
 
-## 10. 默认限制
+## 10. M4 运维状态
+
+`GET|HEAD /api/v1/operations/status`
+
+返回 `schema_version=1`、`disk_level`（`normal|warning|critical|reserve`；存储初始化失败时为 `unavailable`）、`free_bytes`、最近 `checked_at_utc`、可选稳定 `error_code` 和 `retention`（默认 `disabled`）。该端点是只读状态，不提供改变水位、启用删除、执行备份或回滚的 HTTP 操作；高风险运维只能走本机 PowerShell 脚本。存储打开失败时不会以 `normal/free_bytes=0` 假报健康。
+
+## 11. 默认限制
 
 | 配置 | 默认值 |
 |---|---:|
@@ -143,6 +151,12 @@
 | `api.max_page_size` | 500 |
 | `storage.busy_timeout` | 5 秒 |
 | `storage.max_open_connections` | 8 |
+| `storage.warning_free_bytes` | 10 GiB |
+| `storage.critical_free_bytes` | 5 GiB |
+| `storage.database_reserve_bytes` | 1 GiB |
+| `operations.wal_max_bytes` | 64 MiB |
+| `logging.max_file_bytes` / `max_files` | 10 MiB / 5 |
+| `retention.enabled` / `minimum_age` | `false` / 168 小时 |
 | `media_ingest.max_segment_bytes` | 2 GiB |
 | `media_ingest.max_segment_duration` | 10 分钟 |
 | `media_ingest.max_sidecar_bytes` | 64 KiB |

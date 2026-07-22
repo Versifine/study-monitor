@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- 完成 M4：当前用户 Task Scheduler 登录任务、任务/监督双层有界重启、跨启动崩溃窗口和明确 `SUPERVISOR_CRASH_LOOP`；安装升级、回滚和卸载会按受管发布路径停止并等待孤儿子进程，卸载不删除配置、版本或 Evidence。
+- 增加独立 `m4_schema_migrations`，追加故障、模块状态、运行模式切换和保留操作事实；磁盘 normal/warning/critical/reserve 可注入，ActivityWatch 与媒体在每次实际写入前重查水位，保留空间受威胁时不确认核心写入。
+- 增加有界 JSON 日志轮转、WAL checkpoint、严格白名单暂存清理，以及默认关闭、只处理受管 accepted/超龄/完整备份覆盖媒体的保留执行器；删除前后状态和崩溃收敛可审计。
+- `backup.ps1` 支持元数据/完整 Evidence、SQLite 一致快照、严格迁移账本和 SHA-256 manifest；`restore.ps1` 默认新目录，拒绝路径穿越/reparse/重复目标，并以快照数据库、两份清单和恢复媒体哈希交叉证明覆盖；失败或中断不替换上一有效备份、不切换当前数据。
+- 构建生成发布/schema 兼容 manifest；安装校验版本身份、发布路径、同一活动数据库和目标健康后才成功，失败恢复 current/previous；回滚固定检查活动数据库并只切换兼容二进制/配置指针，不做 down migration 或数据库快照恢复。
+- M4 故障注入与真实 smoke 覆盖进程强杀/崩溃循环、数据库忙/只读、网络隔离、复制中切换低磁盘、Minimum、备份/恢复中断、坏/缺项/穿越备份、带空格路径、当前用户任务生命周期，以及固定提交 `89ed656` 的真实 M3 兼容回滚，同时复验 M1-M3。
 - 完成 M3：ActivityWatch 适配器只使用 loopback GET，按允许迟到窗口和有界重扫导入固定 bucket，Core 侧断点跨重启单调推进；失败采集器不影响其他来源或存储 readiness。
 - 增加与 M1 同合同的通用 JSON Evidence 入口、版本化追加心跳、record-only/Minimum mode 与采集器 SLA/计划时段校验；仍不包含原生手机/健康连接器、按键记录或分析判断。
 - 增加 raw event、heartbeat、accepted media 统一时间线，返回原始/设备 UTC/接收/校正时间和显式误差，以稳定复合键和快照 cursor 分页。

@@ -38,6 +38,12 @@ func TestLoadDefaultsAreSafe(t *testing.T) {
 	if cfg.BusyTimeout() != 5*time.Second || cfg.Storage.MaxOpenConnections != 8 {
 		t.Fatalf("unsafe storage defaults: %+v", cfg.Storage)
 	}
+	if cfg.Storage.WarningFreeBytes != 10<<30 || cfg.Storage.CriticalFreeBytes != 5<<30 || cfg.Storage.DatabaseReserveBytes != 1<<30 || cfg.Retention.Enabled || !cfg.Retention.RequireFullBackup || cfg.RetentionMinimumAge() != 168*time.Hour {
+		t.Fatalf("unsafe M4 storage/retention defaults: storage=%+v retention=%+v", cfg.Storage, cfg.Retention)
+	}
+	if !cfg.Logging.FileEnabled || cfg.Logging.MaxFileBytes != 10<<20 || cfg.Logging.MaxFiles != 5 || cfg.Operations.WALMaxBytes != 64<<20 || cfg.TempMaxAge() != 24*time.Hour {
+		t.Fatalf("unsafe M4 operations defaults: logging=%+v operations=%+v", cfg.Logging, cfg.Operations)
+	}
 	if cfg.API.MaxRequestBytes != 1<<20 || cfg.API.MaxBatchEvents != 100 || cfg.API.MaxEventBytes != 64<<10 ||
 		cfg.API.MaxPayloadDepth != 16 || cfg.API.MaxConcurrentWrites != 4 || cfg.API.DefaultPageSize != 100 || cfg.API.MaxPageSize != 500 {
 		t.Fatalf("unsafe API defaults: %+v", cfg.API)
@@ -202,6 +208,11 @@ func TestLoadRejectsInvalidInput(t *testing.T) {
 		{name: "read timeout before header timeout", json: `{"schema_version":1,"server":{"read_header_timeout":"8s","read_timeout":"5s"}}`, code: CodeInvalidTimeout},
 		{name: "short busy timeout", json: `{"schema_version":1,"storage":{"busy_timeout":"10ms"}}`, code: CodeInvalidStorage},
 		{name: "too many database connections", json: `{"schema_version":1,"storage":{"max_open_connections":33}}`, code: CodeInvalidStorage},
+		{name: "unordered disk thresholds", json: `{"schema_version":1,"storage":{"warning_free_bytes":100000000,"critical_free_bytes":200000000}}`, code: CodeInvalidStorage},
+		{name: "short retention", json: `{"schema_version":1,"retention":{"minimum_age":"1h"}}`, code: CodeInvalidRetention},
+		{name: "retention without full backup", json: `{"schema_version":1,"retention":{"enabled":true,"require_full_backup":false}}`, code: CodeInvalidRetention},
+		{name: "tiny wal limit", json: `{"schema_version":1,"operations":{"wal_max_bytes":1024}}`, code: CodeInvalidOperations},
+		{name: "single log file", json: `{"schema_version":1,"logging":{"max_files":1}}`, code: CodeInvalidLogLevel},
 		{name: "small request limit", json: `{"schema_version":1,"api":{"max_request_bytes":1024}}`, code: CodeInvalidAPILimit},
 		{name: "event limit exceeds request", json: `{"schema_version":1,"api":{"max_request_bytes":65536,"max_event_bytes":65536}}`, code: CodeInvalidAPILimit},
 		{name: "page default exceeds maximum", json: `{"schema_version":1,"api":{"default_page_size":501,"max_page_size":500}}`, code: CodeInvalidAPILimit},

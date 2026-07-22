@@ -50,6 +50,10 @@ AI 分析未安装/关闭、分析积压、分类错误、周报延迟和 UI 体
 
 具体水位在 M6 冻结清单中记录，认证期间不得放宽。
 
+M4 安全默认值为：预警 `10 GiB`、关键 `5 GiB`、数据库保留空间 `1 GiB`，并强制满足 `预警 > 关键 > 保留空间 >= 64 MiB`。后台每 30 秒检查并持久化状态转换；此外 HTTP/ActivityWatch 的每次实际提交和媒体每个 1 MiB 复制块/原子改名前都会同步调用系统可用空间探针，不复读后台缓存，因而最坏单次媒体在途写入远小于最小保留空间。测试通过可变探针覆盖运行中从 normal 切到 reserve，不会真的填满磁盘。`/api/v1/operations/status` 返回最近一次（包括提交门控触发的）水位、可用字节、错误码、检查时间和保留模块状态。保留扫描只读取并校验完整备份 manifest 后建立元数据索引，再查询最多 `max_deletes_per_run` 个候选；只对这些候选对应的备份本体和受管源文件做大小/SHA-256 校验，不会在每轮扫描重哈希整份备份。
+
+日志写入 `<data>\logs\exam-monitor.jsonl`，默认每份 `10 MiB`、保留 5 份。WAL 默认每 5 分钟 checkpoint；超过 `64 MiB` 时请求 `TRUNCATE`。临时清理只识别 `<data>\media\staging` 内、名称为 64 位十六进制加 `.partial`、超过 24 小时且不被最新导入事实引用的普通文件；不扫描或删除来源入口、隔离区和未知文件。
+
 ## 7. 备份与恢复
 
 备份分为：
@@ -59,7 +63,22 @@ AI 分析未安装/关闭、分析积压、分类错误、周报延迟和 UI 体
 
 元数据备份不等同于媒体灾难恢复，界面和报告必须明确标注覆盖范围。备份成功只在所有校验通过后确认。
 
-恢复默认写入新目录：先校验备份、恢复文件、运行数据库完整性和媒体清单校验，再由显式步骤切换。默认不得覆盖当前数据目录。M6 必须从实际备份演练完整恢复，并用抽样回放或字节校验证明媒体可用。
+恢复默认写入新目录：先拒绝绝对路径、双斜杠穿越、reparse point 和重复目标，复制每个文件后立即复核大小与 SHA-256，再运行数据库完整性、四个迁移账本和媒体清单校验。完整备份恢复以快照数据库中的 accepted/restored 清单为权威，与主 manifest、`metadata/media-manifest.json` 和恢复后的每个媒体本体逐项交叉验证；删掉清单条目不能把缺失 Evidence 伪装成完整恢复。默认不得覆盖或切换当前数据目录。M6 必须从实际备份演练完整恢复，并用抽样回放或字节校验证明媒体可用。
+
+实际命令（所有路径使用绝对路径）：
+
+```powershell
+# 元数据备份；不包含媒体本体，manifest 会明确 included=false
+.\scripts\backup.ps1 -BinaryPath C:\ExamMonitor\exam-monitor.exe -ConfigPath C:\ExamMonitor\exam-monitor.json -DestinationDirectory E:\ExamMonitorBackups -Type metadata
+
+# 完整 Evidence 备份；只有全部哈希验证通过才更新 data\backup\latest-full.json
+.\scripts\backup.ps1 -BinaryPath C:\ExamMonitor\exam-monitor.exe -ConfigPath C:\ExamMonitor\exam-monitor.json -DestinationDirectory E:\ExamMonitorBackups -Type full
+
+# 默认/推荐恢复到一个不存在的新目录，不切换当前数据根
+.\scripts\restore.ps1 -BackupDirectory E:\ExamMonitorBackups\exam-monitor-... -VerifierBinaryPath C:\ExamMonitor\exam-monitor.exe -TargetDirectory E:\ExamMonitorRestored
+```
+
+数据库快照由核心二进制使用 SQLite `VACUUM INTO` 生成，随后只读执行 `PRAGMA integrity_check`，并按内嵌迁移逐项核对四个账本的版本、名称、顺序和 SHA-256。manifest 最后写入，列出备份类型、覆盖声明、数据库/配置/构建/schema/恢复脚本和每个受管媒体的大小、SHA-256 与是否包含本体。失败和中断不会替换上一份完整备份标记。`-ConfirmOverwrite` 只允许显式处理已存在恢复目录，并先把旧目录移动为可恢复的 `.pre-restore-*`，不直接删除。
 
 ## 8. 应用回滚
 
@@ -72,6 +91,21 @@ AI 分析未安装/关闭、分析积压、分类错误、周报延迟和 UI 体
 5. 失败时保留当前 Evidence 和两个应用版本，进入安全降级
 
 回滚不删除数据、不执行 down migration、不恢复旧数据库快照。数据恢复是独立且显式的操作。
+
+构建、安装、回滚和卸载命令：
+
+```powershell
+$binary = (.\scripts\build.ps1 -OutputDirectory C:\ExamMonitorBuild | Select-Object -Last 1)
+.\scripts\install.ps1 -BinaryPath $binary -ConfigPath C:\ExamMonitor\exam-monitor.json
+.\scripts\rollback.ps1
+.\scripts\uninstall.ps1
+```
+
+`build.ps1` 同目录生成 `release-manifest.json`，记录二进制 SHA-256、版本/commit/build time、配置 schema 和 core/media/M3/M4 数据库兼容范围。`install.ps1` 先用待安装二进制执行 `--version`/`--check-config`，拒绝发布路径逃逸、同一版本号下不同二进制/manifest/配置，以及升级时改变规范化数据库路径（切换数据根只能走显式恢复流程）；随后结束旧任务和受管子进程，在 `%LOCALAPPDATA%\ExamMonitor\releases\<version>` 保留版本并原子维护 `current.json`/`previous.json`。任务以当前用户 `InteractiveToken`、`LeastPrivilege` 注册登录触发。`/Run` 返回成功后还必须在默认 45 秒内看到目标 `/health/live.version` 和 writable readiness，否则自动停净失败版本、恢复指针并重启旧任务；首次安装失败会删除无效任务。任务层最多失败重启 3 次；`run-supervised.ps1` 还会持久化 10 分钟崩溃窗口，默认最多 5 次指数退避，随后写 `SUPERVISOR_CRASH_LOOP` 并停止。
+
+`rollback.ps1` 在停止任务前分别校验当前/上一版配置，并要求二者解析到同一个规范化数据库路径；schema 检查始终固定读取当前活动数据库，即使借用另一版本中支持维护 CLI 的二进制，也不能误查目标配置指向的另一数据库。M3 数据库没有 M4 账本时按 `m4=0` 检查，不兼容时拒绝。成功路径只切换应用/配置指针，启动任务并检查 `/health/live` 的版本和 `/health/ready`；失败时先结束失败进程，再恢复原指针并重启原版本。Windows 结束计划任务不会自动保证其 `exam-monitor.exe` 子进程退出，因此安装、回滚和卸载共用 `process-control.ps1`：只识别 `%LOCALAPPDATA%\ExamMonitor\releases` 下路径已验证的受管二进制，停止并等待清零，拒绝按未验证 PID 误杀其他进程。`uninstall.ps1` 删除任务和受管进程，但版本、配置、状态和 Evidence 均保留。
+
+M4 故障矩阵可运行 `.\scripts\fault-injection.ps1`；完整真实闭环由 `.\scripts\smoke.ps1` 执行，所有破坏性场景使用临时目录和唯一临时任务名。回滚 smoke 从固定提交 `89ed656` 构建真实 M3 二进制，先安装 M3 再安装候选，并在同一前向数据库上启动回滚后的 M3；不是只改版本字符串重编候选。
 
 ## 9. 升级
 

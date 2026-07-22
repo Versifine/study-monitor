@@ -4,11 +4,13 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -257,6 +259,110 @@ func TestReadinessReportsWritableAndInitializationFailure(t *testing.T) {
 	failed.ServeHTTP(live, httptest.NewRequest(http.MethodGet, "/health/live", nil))
 	if live.Code != http.StatusOK {
 		t.Fatalf("liveness must survive storage failure: %d %s", live.Code, live.Body.String())
+	}
+	operationsResponse := httptest.NewRecorder()
+	failed.ServeHTTP(operationsResponse, httptest.NewRequest(http.MethodGet, "/api/v1/operations/status", nil))
+	var operationsBody map[string]any
+	decodeResponse(t, operationsResponse, &operationsBody)
+	if operationsBody["disk_level"] != "unavailable" || operationsBody["error_code"] != eventstore.CodeMigrationUnsupported {
+		t.Fatalf("failed storage operations status=%#v", operationsBody)
+	}
+}
+
+type coverageTransitionStore struct {
+	blockingStore
+	calls int
+}
+
+func (store *coverageTransitionStore) RebuildCoverage(context.Context, []config.CollectorConfig, time.Time, time.Time, time.Time, time.Duration, int) (eventstore.CoverageResult, error) {
+	store.calls++
+	if store.calls <= 2 {
+		return eventstore.CoverageResult{}, &eventstore.Error{Code: eventstore.CodeCoverageBuildFailed, Err: errors.New("injected coverage failure")}
+	}
+	return eventstore.CoverageResult{}, nil
+}
+
+type operationTransitionRecorder struct {
+	faults  []string
+	modules []string
+}
+
+type secondCheckReserveGate struct{ calls atomic.Int32 }
+
+func (gate *secondCheckReserveGate) CoreWritesAllowed() (bool, string) {
+	if gate.calls.Add(1) == 1 {
+		return true, ""
+	}
+	return false, "TEST_DATABASE_RESERVE"
+}
+
+type countingWriteStore struct {
+	blockingStore
+	events, heartbeats atomic.Int32
+}
+
+func (store *countingWriteStore) AppendBatch(context.Context, []eventstore.Candidate) ([]eventstore.WriteResult, error) {
+	store.events.Add(1)
+	return nil, nil
+}
+
+func (store *countingWriteStore) AppendHeartbeatBatch(context.Context, []eventstore.HeartbeatCandidate) ([]eventstore.HeartbeatWriteResult, error) {
+	store.heartbeats.Add(1)
+	return nil, nil
+}
+
+func TestCoreWriteEndpointsRecheckReserveImmediatelyBeforeStoreCommit(t *testing.T) {
+	for _, test := range []struct {
+		name, path, body string
+	}{
+		{"events", "/api/v1/events/batch", `{"schema_version":1,"events":[{}]}`},
+		{"heartbeats", "/api/v1/collectors/heartbeats/batch", `{"schema_version":1,"heartbeats":[{}]}`},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			cfg := testConfig(t)
+			store := &countingWriteStore{}
+			gate := &secondCheckReserveGate{}
+			handler := New(cfg, testLogger(t), version.Info{Version: "test"}, store, StorageFailure{}, gate)
+			response := performJSON(handler, http.MethodPost, test.path, test.body, nil)
+			if response.Code != http.StatusInsufficientStorage || responseErrorCode(t, response) != "TEST_DATABASE_RESERVE" {
+				t.Fatalf("reserve recheck status=%d body=%s", response.Code, response.Body.String())
+			}
+			if store.events.Load() != 0 || store.heartbeats.Load() != 0 || gate.calls.Load() != 2 {
+				t.Fatalf("reserve recheck calls gate=%d events=%d heartbeats=%d", gate.calls.Load(), store.events.Load(), store.heartbeats.Load())
+			}
+		})
+	}
+}
+
+func (recorder *operationTransitionRecorder) RecordFault(_ context.Context, _, _, status, code, _ string) {
+	recorder.faults = append(recorder.faults, status+":"+code)
+}
+
+func (recorder *operationTransitionRecorder) RecordModuleState(_ context.Context, _, status, reason string) {
+	recorder.modules = append(recorder.modules, status+":"+reason)
+}
+
+func TestCoverageFailureAndRecoveryAreRecordedOncePerTransition(t *testing.T) {
+	cfg := testConfig(t)
+	store := &coverageTransitionStore{}
+	recorder := &operationTransitionRecorder{}
+	handler := New(cfg, testLogger(t), version.Info{Version: "test"}, store, StorageFailure{}, recorder)
+	target := "/api/v1/coverage?start=2026-07-20T00:00:00Z&end=2026-07-20T00:10:00Z"
+	for index := 0; index < 3; index++ {
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, httptest.NewRequest(http.MethodGet, target, nil))
+		if index < 2 && response.Code < 500 {
+			t.Fatalf("coverage failure %d status=%d body=%s", index, response.Code, response.Body.String())
+		}
+		if index == 2 && response.Code != http.StatusOK {
+			t.Fatalf("coverage recovery status=%d body=%s", response.Code, response.Body.String())
+		}
+	}
+	if len(recorder.faults) != 2 || recorder.faults[0] != "degraded:"+eventstore.CodeCoverageBuildFailed || recorder.faults[1] != "recovered:COVERAGE_RECOVERED" {
+		t.Fatalf("coverage fault transitions=%#v", recorder.faults)
+	}
+	if len(recorder.modules) != 2 || recorder.modules[0] != "degraded:"+eventstore.CodeCoverageBuildFailed || recorder.modules[1] != "healthy:COVERAGE_RECOVERED" {
+		t.Fatalf("coverage module transitions=%#v", recorder.modules)
 	}
 }
 

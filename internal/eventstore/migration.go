@@ -17,6 +17,7 @@ const (
 	CurrentSchemaVersion      = 1
 	currentMediaSchemaVersion = 2
 	currentM3SchemaVersion    = 1
+	currentM4SchemaVersion    = 1
 )
 
 type migration struct {
@@ -36,6 +37,10 @@ func repositoryMediaMigrations() ([]migration, error) {
 
 func repositoryM3Migrations() ([]migration, error) {
 	return loadMigrations([]string{"004_collectors_timeline.sql"})
+}
+
+func repositoryM4Migrations() ([]migration, error) {
+	return loadMigrations([]string{"005_operations.sql"})
 }
 
 func loadMigrations(files []string) ([]migration, error) {
@@ -75,7 +80,14 @@ func migrate(ctx context.Context, db *sql.DB, now func() time.Time) error {
 	if err != nil {
 		return wrap(CodeMigrationFailed, "load embedded M3 migrations", err)
 	}
-	return applyM3Migrations(ctx, db, m3Migrations, now)
+	if err := applyM3Migrations(ctx, db, m3Migrations, now); err != nil {
+		return err
+	}
+	m4Migrations, err := repositoryM4Migrations()
+	if err != nil {
+		return wrap(CodeMigrationFailed, "load embedded M4 migrations", err)
+	}
+	return applyM4Migrations(ctx, db, m4Migrations, now)
 }
 
 func applyMigrations(ctx context.Context, db *sql.DB, migrations []migration, now func() time.Time) error {
@@ -201,6 +213,10 @@ func applyMediaMigrations(ctx context.Context, db *sql.DB, migrations []migratio
 
 func applyM3Migrations(ctx context.Context, db *sql.DB, migrations []migration, now func() time.Time) error {
 	return applyIndependentMigrations(ctx, db, migrations, now, "m3_schema_migrations", "M3_SCHEMA_MIGRATIONS", "M3", currentM3SchemaVersion)
+}
+
+func applyM4Migrations(ctx context.Context, db *sql.DB, migrations []migration, now func() time.Time) error {
+	return applyIndependentMigrations(ctx, db, migrations, now, "m4_schema_migrations", "M4_SCHEMA_MIGRATIONS", "M4", currentM4SchemaVersion)
 }
 
 func applyIndependentMigrations(ctx context.Context, db *sql.DB, migrations []migration, now func() time.Time, ledger, triggerPrefix, label string, targetVersion int) error {

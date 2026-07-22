@@ -6,9 +6,9 @@
 
 ## 当前阶段
 
-- 当前日期：2026-07-20
+- 当前日期：2026-07-22
 - 计划：2026 年 9 月开始进入持续备考节奏
-- 当前状态：M0、M1、M2、M3 已完成；M4 尚未开始
+- 当前状态：M0、M1、M2、M3、M4 已完成；M5 尚未开始
 - 冻结目标：Recorder Core 通过 M0-M6 后才成为正式依赖，不为赶日期压缩验收
 - 正式备考期间：只允许重启、回滚、关闭故障模块，不进行研究性调参和功能开发
 
@@ -36,13 +36,13 @@
 
 Version 1 的完整建议目录和模块边界见 [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)。不预建分析、模型或微服务目录。
 
-当前已实现 M1 的 SQLite 仅追加事件存储与本地 API，M2 的外部短视频受管导入，以及 M3 的 ActivityWatch GET-only 适配、通用 JSON Evidence、追加心跳、按计划覆盖率和统一时间线。仍不包含保留/磁盘保护、Windows 自动恢复、备份恢复、前端或 AI。
+当前已实现 M1 的 SQLite 仅追加事件存储与本地 API，M2 的外部短视频受管导入，M3 的 ActivityWatch GET-only 适配、通用 JSON Evidence、追加心跳、按计划覆盖率和统一时间线，以及 M4 的 Windows 有界自动恢复、磁盘保护、默认关闭的严格媒体保留、可验证备份/新目录恢复和兼容应用回滚。仍不包含只读前端、自动升级、云端必需备份或 AI。
 
 ## 你现在应该做什么
 
-先审查 M3 的测试、构建、smoke 和 Git 检查点，然后停止。只有在单独确认后，才把 [`codex-prompts/05_M4.txt`](codex-prompts/05_M4.txt) 作为下一次任务；不要提前进入保留/磁盘保护、Windows 自动恢复、备份恢复、前端或 AI。
+先审查 M4 的测试、构建、故障注入、smoke 和 Git 检查点，然后停止。只有在单独确认后，才把 [`codex-prompts/06_M5.txt`](codex-prompts/06_M5.txt) 作为下一次任务；不要提前进入前端或 AI。
 
-## M3 本地命令
+## M4 本地命令
 
 要求 Windows PowerShell 5.1 和 Go 1.25.4：
 
@@ -52,9 +52,10 @@ Version 1 的完整建议目录和模块边界见 [`docs/ARCHITECTURE.md`](docs/
 .\scripts\test.ps1
 .\scripts\build.ps1
 .\scripts\smoke.ps1
+.\scripts\fault-injection.ps1 -SkipOperationalSmoke
 ```
 
-默认仅监听 `127.0.0.1:47831`。`GET /health/live` 只表示进程存活；`GET /health/ready` 检查 SQLite 是否可写；`POST /api/v1/events/batch` 和 `/api/v1/evidence/batch` 接收同合同版本化幂等事件；`POST /api/v1/collectors/heartbeats/batch` 追加心跳；`GET /api/v1/timeline` 与 `/api/v1/coverage` 提供稳定时间线和明确缺口。完整合同见 [`docs/API.md`](docs/API.md) 与 [`docs/COLLECTORS_AND_TIMELINE.md`](docs/COLLECTORS_AND_TIMELINE.md)。
+默认仅监听 `127.0.0.1:47831`。`GET /health/live` 只表示进程存活；`GET /health/ready` 检查 SQLite 与数据库保留空间是否允许确认写入；`POST /api/v1/events/batch` 和 `/api/v1/evidence/batch` 接收同合同版本化幂等事件；`POST /api/v1/collectors/heartbeats/batch` 追加心跳；`GET /api/v1/timeline` 与 `/api/v1/coverage` 提供稳定时间线和明确缺口；`GET /api/v1/operations/status` 暴露磁盘与保留状态。完整合同见 [`docs/API.md`](docs/API.md)、[`docs/COLLECTORS_AND_TIMELINE.md`](docs/COLLECTORS_AND_TIMELINE.md) 与 [`docs/OPERATIONS.md`](docs/OPERATIONS.md)。
 
 ActivityWatch 默认关闭。启用后每个配置只读一个 loopback bucket，保留允许迟到窗口和重扫重叠区间，断点存于 Recorder Core；任何失败只把该采集器标为 `unavailable`。通用 JSON 是 Version 1 手机/健康数据的唯一入口，不包含原生连接器。
 

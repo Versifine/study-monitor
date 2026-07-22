@@ -48,6 +48,7 @@ const (
 	CodeStorageFailed        = "MEDIA_STORAGE_FAILED"
 	CodeDatabaseFailed       = "MEDIA_DATABASE_FAILED"
 	CodeQuarantineFailed     = "MEDIA_QUARANTINE_FAILED"
+	CodeStorageProtected     = "MEDIA_STORAGE_PROTECTED"
 )
 
 type Error struct {
@@ -79,6 +80,14 @@ type Repository interface {
 type Prober interface {
 	Version(context.Context, time.Duration) (string, error)
 	Probe(context.Context, string, time.Duration) (ProbeInfo, error)
+}
+
+type StorageGate interface {
+	MediaAllowed() (bool, string)
+}
+
+type FaultRecorder interface {
+	RecordFault(context.Context, string, string, string, string, string)
 }
 
 type ProbeInfo struct {

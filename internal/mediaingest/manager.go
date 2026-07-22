@@ -30,6 +30,8 @@ type Manager struct {
 	logger     *logging.Logger
 	now        func() time.Time
 	state      *statusState
+	gate       StorageGate
+	faults     FaultRecorder
 
 	storageRoot    string
 	stagingRoot    string
@@ -43,6 +45,10 @@ type Manager struct {
 
 	scanMu     sync.Mutex
 	scanCursor string
+}
+
+type coreWriteGate interface {
+	CoreWritesAllowed() (bool, string)
 }
 
 type fileStamp struct {
@@ -116,6 +122,15 @@ func New(cfg config.Config, repository Repository, logger *logging.Logger) *Mana
 	return newManager(cfg, repository, ExecProber{Path: cfg.MediaIngest.FFprobePath}, logger, time.Now)
 }
 
+func NewWithGate(cfg config.Config, repository Repository, logger *logging.Logger, gate StorageGate) *Manager {
+	manager := newManager(cfg, repository, ExecProber{Path: cfg.MediaIngest.FFprobePath}, logger, time.Now)
+	manager.gate = gate
+	if recorder, ok := gate.(FaultRecorder); ok {
+		manager.faults = recorder
+	}
+	return manager
+}
+
 func newManager(cfg config.Config, repository Repository, prober Prober, logger *logging.Logger, now func() time.Time) *Manager {
 	state := ModuleDisabled
 	if cfg.MediaIngest.Enabled {
@@ -157,6 +172,9 @@ func (manager *Manager) Initialize(ctx context.Context) error {
 	if version != SupportedFFprobeVersion {
 		return manager.setUnavailable(CodeProbeVersionMismatch, fmt.Errorf("unsupported ffprobe version %q", version))
 	}
+	if err := manager.ensureCoreWritesAllowed(); err != nil {
+		return manager.setUnavailable(CodeStorageProtected, err)
+	}
 	if err := manager.repository.RebuildMediaProjections(ctx); err != nil {
 		return manager.setUnavailable(CodeDatabaseFailed, err)
 	}
@@ -165,6 +183,27 @@ func (manager *Manager) Initialize(ctx context.Context) error {
 	manager.state.status.ErrorCode = ""
 	manager.state.initialized = true
 	manager.state.Unlock()
+	return nil
+}
+
+func (manager *Manager) ensureMediaAllowed() error {
+	if manager.gate == nil {
+		return nil
+	}
+	if allowed, reason := manager.gate.MediaAllowed(); !allowed {
+		return &Error{Code: CodeStorageProtected, Err: fmt.Errorf("media ingest paused by storage protection: %s", reason)}
+	}
+	return nil
+}
+
+func (manager *Manager) ensureCoreWritesAllowed() error {
+	gate, ok := manager.gate.(coreWriteGate)
+	if !ok {
+		return nil
+	}
+	if allowed, reason := gate.CoreWritesAllowed(); !allowed {
+		return &Error{Code: CodeStorageProtected, Err: fmt.Errorf("media metadata writes paused by storage protection: %s", reason)}
+	}
 	return nil
 }
 
@@ -199,6 +238,7 @@ func (manager *Manager) scanAndLog(ctx context.Context) {
 		return
 	}
 	manager.state.Lock()
+	previousStatus, previousCode := manager.state.status.Status, manager.state.status.ErrorCode
 	if err != nil {
 		manager.state.status.Status = ModuleUnavailable
 		manager.state.status.ErrorCode = ErrorCode(err)
@@ -209,6 +249,13 @@ func (manager *Manager) scanAndLog(ctx context.Context) {
 	manager.state.Unlock()
 	if err != nil && manager.logger != nil {
 		manager.logger.Error("media_ingest", "scan_failed", ErrorCode(err), "media ingest scan failed", err)
+	}
+	if manager.faults != nil {
+		if err != nil && (previousStatus != ModuleUnavailable || previousCode != ErrorCode(err)) {
+			manager.faults.RecordFault(ctx, "media_ingest", "P2", "degraded", ErrorCode(err), err.Error())
+		} else if err == nil && previousStatus == ModuleUnavailable && previousCode != "" {
+			manager.faults.RecordFault(ctx, "media_ingest", "P3", "recovered", "MEDIA_INGEST_RECOVERED", "media ingest recovered")
+		}
 	}
 }
 
@@ -232,6 +279,9 @@ func (manager *Manager) ScanOnce(ctx context.Context) error {
 	defer manager.scanMu.Unlock()
 	if !manager.state.isInitialized() {
 		return &Error{Code: CodeProbeUnavailable, Err: errors.New("media ingest module is not healthy")}
+	}
+	if err := manager.ensureMediaAllowed(); err != nil {
+		return err
 	}
 	version, err := manager.prober.Version(ctx, manager.config.FFprobeTimeout())
 	if err != nil {
@@ -304,6 +354,12 @@ func (manager *Manager) ScanOnce(ctx context.Context) error {
 	}
 	var firstError error
 	for _, candidate := range selected {
+		if gateErr := manager.ensureMediaAllowed(); gateErr != nil {
+			if firstError == nil {
+				firstError = gateErr
+			}
+			break
+		}
 		readyPath := candidate.path
 		manager.scanCursor = candidate.key
 		confirmed, confirmationErr := manager.confirmationValid(ctx, strings.TrimSuffix(readyPath, ReadySuffix)+ConfirmationSuffix)
@@ -358,6 +414,9 @@ func saturatedAdd(left, right int64) int64 {
 }
 
 func (manager *Manager) ProcessReady(ctx context.Context, readyPath string) (bool, error) {
+	if err := manager.ensureMediaAllowed(); err != nil {
+		return false, err
+	}
 	if err := ensureSafePath(manager.config.MediaIngest.InboxDirectory, readyPath, true); err != nil {
 		return false, err
 	}
@@ -445,6 +504,9 @@ func (manager *Manager) ProcessReady(ctx context.Context, readyPath string) (boo
 	stagingPath := filepath.Join(manager.stagingRoot, identity.ingestKey+".partial")
 	copyResult, err := manager.copyToStaging(mediaPath, stagingPath)
 	if err != nil {
+		if ErrorCode(err) == CodeStorageProtected {
+			return false, err
+		}
 		return false, manager.record(ctx, identity, "failed", ErrorCode(err), manager.relativeManaged(stagingPath), 0)
 	}
 	if copyResult.size != sidecar.SizeBytes {
@@ -544,6 +606,9 @@ func (manager *Manager) ProcessReady(ctx context.Context, readyPath string) (boo
 	}
 	acceptEvent := manager.makeEvent(identity, "accepted", "", managedRelativePath, claim.SegmentID)
 	stateEventKey := hashText("media-state\x00accepted\x00" + sidecar.CollectorID + "\x00" + sidecar.SourceIdempotencyKey + "\x00" + metadataDigest)
+	if err := manager.ensureCoreWritesAllowed(); err != nil {
+		return false, err
+	}
 	claim, err = manager.repository.AcceptMedia(ctx, metadata, acceptEvent, stateEventKey)
 	if err != nil {
 		return false, &Error{Code: CodeDatabaseFailed, Err: err}
@@ -552,6 +617,9 @@ func (manager *Manager) ProcessReady(ctx context.Context, readyPath string) (boo
 		return false, manager.quarantine(ctx, identity, mediaPath, sidecarRaw, "", CodeIdempotencyConflict)
 	}
 	acceptedAt := receivedAt
+	if err := manager.ensureMediaAllowed(); err != nil {
+		return false, err
+	}
 	if err := manager.writeConfirmation(confirmationPath, confirmation{
 		SchemaVersion:        StatusSchemaVersion,
 		CollectorID:          sidecar.CollectorID,
@@ -598,6 +666,9 @@ func (manager *Manager) readInboxFile(path string, maximum int64) ([]byte, error
 }
 
 func (manager *Manager) record(ctx context.Context, identity processIdentity, status, errorCode, temporaryPath string, segmentID int64) error {
+	if err := manager.ensureCoreWritesAllowed(); err != nil {
+		return err
+	}
 	event := manager.makeEvent(identity, status, errorCode, temporaryPath, segmentID)
 	if err := manager.repository.AppendMediaIngestEvent(ctx, event); err != nil {
 		return &Error{Code: CodeDatabaseFailed, Err: err}
@@ -694,6 +765,9 @@ func (manager *Manager) rememberTerminal(ctx context.Context, identity processId
 	if err != nil {
 		return &Error{Code: CodeQuarantineFailed, Err: errors.New("quarantine artifacts cannot be verified")}
 	}
+	if err := manager.ensureCoreWritesAllowed(); err != nil {
+		return err
+	}
 	if err := manager.repository.SaveMediaFileCheck(ctx, identity.ingestKey, "quarantined", signature, manager.now().UTC().Format(time.RFC3339Nano)); err != nil {
 		return &Error{Code: CodeDatabaseFailed, Err: err}
 	}
@@ -757,6 +831,9 @@ func (manager *Manager) confirmationValid(ctx context.Context, path string) (boo
 		return false, err
 	}
 	ingestKey := hashText(strings.ToLower(filepath.Clean(manager.config.MediaIngest.InboxDirectory)) + "\x00" + filepath.Base(mediaPath))
+	if err := manager.ensureCoreWritesAllowed(); err != nil {
+		return false, err
+	}
 	if err := manager.repository.SaveMediaFileCheck(ctx, ingestKey, "confirmed", signature, manager.now().UTC().Format(time.RFC3339Nano)); err != nil {
 		return false, &Error{Code: CodeDatabaseFailed, Err: err}
 	}

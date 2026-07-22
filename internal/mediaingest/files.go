@@ -20,6 +20,9 @@ type copiedFile struct {
 }
 
 func (manager *Manager) copyToStaging(sourcePath, stagingPath string) (copiedFile, error) {
+	if err := manager.ensureMediaAllowed(); err != nil {
+		return copiedFile{}, err
+	}
 	if err := ensureSafePath(manager.config.MediaIngest.InboxDirectory, sourcePath, true); err != nil {
 		return copiedFile{}, err
 	}
@@ -43,12 +46,15 @@ func (manager *Manager) copyToStaging(sourcePath, stagingPath string) (copiedFil
 	}()
 
 	digest := sha256.New()
-	reader := bufio.NewReaderSize(source, 64<<10)
-	buffer := make([]byte, 64<<10)
+	reader := bufio.NewReaderSize(source, 1<<20)
+	buffer := make([]byte, 1<<20)
 	total := int64(0)
 	for {
 		read, readErr := reader.Read(buffer)
 		if read > 0 {
+			if err := manager.ensureMediaAllowed(); err != nil {
+				return copiedFile{}, err
+			}
 			total += int64(read)
 			if total > manager.config.MediaIngest.MaxSegmentBytes {
 				return copiedFile{}, &Error{Code: CodeTooLarge, Err: errors.New("source media exceeds configured size")}
@@ -62,6 +68,9 @@ func (manager *Manager) copyToStaging(sourcePath, stagingPath string) (copiedFil
 					return copiedFile{}, &Error{Code: CodeStorageFailed, Err: err}
 				}
 			}
+			if err := manager.ensureMediaAllowed(); err != nil {
+				return copiedFile{}, err
+			}
 		}
 		if errors.Is(readErr, io.EOF) {
 			break
@@ -69,6 +78,9 @@ func (manager *Manager) copyToStaging(sourcePath, stagingPath string) (copiedFil
 		if readErr != nil {
 			return copiedFile{}, &Error{Code: CodeStorageFailed, Err: errors.New("read source media failed")}
 		}
+	}
+	if err := manager.ensureMediaAllowed(); err != nil {
+		return copiedFile{}, err
 	}
 	if err := target.Sync(); err != nil {
 		return copiedFile{}, &Error{Code: CodeStorageFailed, Err: errors.New("flush staging media failed")}
@@ -85,6 +97,9 @@ func (manager *Manager) copyToStaging(sourcePath, stagingPath string) (copiedFil
 }
 
 func (manager *Manager) installAccepted(stagingPath, acceptedPath string, size int64, expectedHash string) error {
+	if err := manager.ensureMediaAllowed(); err != nil {
+		return err
+	}
 	if err := ensureManagedFileTarget(manager.stagingRoot, stagingPath); err != nil {
 		return err
 	}
@@ -101,6 +116,9 @@ func (manager *Manager) installAccepted(stagingPath, acceptedPath string, size i
 		return nil
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return &Error{Code: CodeStorageFailed, Err: errors.New("accepted media path cannot be inspected")}
+	}
+	if err := manager.ensureMediaAllowed(); err != nil {
+		return err
 	}
 	if err := os.Rename(stagingPath, acceptedPath); err != nil {
 		return &Error{Code: CodeStorageFailed, Err: errors.New("staging media cannot be atomically renamed")}
@@ -193,6 +211,9 @@ func ensureManagedPath(root, path string, requireRegular bool) error {
 }
 
 func (manager *Manager) quarantine(ctx context.Context, identity processIdentity, sourcePath string, sidecarRaw []byte, stagingPath, reasonCode string) error {
+	if err := manager.ensureMediaAllowed(); err != nil {
+		return err
+	}
 	if manager.beforeQuarantine != nil {
 		if err := manager.beforeQuarantine(); err != nil {
 			_ = manager.record(ctx, identity, "failed", CodeQuarantineFailed, manager.relativeManaged(stagingPath), 0)
@@ -216,6 +237,9 @@ func (manager *Manager) quarantine(ctx context.Context, identity processIdentity
 				_ = manager.record(ctx, identity, "failed", CodeQuarantineFailed, manager.relativeManaged(stagingPath), 0)
 				return &Error{Code: CodeQuarantineFailed, Err: errors.New("quarantine staging media cannot be verified")}
 			}
+			if err := manager.ensureMediaAllowed(); err != nil {
+				return err
+			}
 			if err := os.Rename(stagingPath, mediaTarget); err != nil {
 				_ = manager.record(ctx, identity, "failed", CodeQuarantineFailed, manager.relativeManaged(stagingPath), 0)
 				return &Error{Code: CodeQuarantineFailed, Err: errors.New("staging media cannot enter quarantine")}
@@ -237,6 +261,9 @@ func (manager *Manager) quarantine(ctx context.Context, identity processIdentity
 			if result.size > manager.config.MediaIngest.MaxSegmentBytes {
 				_ = manager.record(ctx, identity, "failed", CodeTooLarge, "", 0)
 				return &Error{Code: CodeTooLarge, Err: errors.New("media is too large to quarantine")}
+			}
+			if err := manager.ensureMediaAllowed(); err != nil {
+				return err
 			}
 			if err := os.Rename(temporary, mediaTarget); err != nil {
 				_ = manager.record(ctx, identity, "failed", CodeQuarantineFailed, "", 0)
@@ -306,6 +333,9 @@ func (manager *Manager) quarantine(ctx context.Context, identity processIdentity
 }
 
 func (manager *Manager) copyToQuarantine(sourcePath, targetPath string) (copiedFile, error) {
+	if err := manager.ensureMediaAllowed(); err != nil {
+		return copiedFile{}, err
+	}
 	if err := ensureSafePath(manager.config.MediaIngest.InboxDirectory, sourcePath, true); err != nil {
 		return copiedFile{}, err
 	}
@@ -322,14 +352,38 @@ func (manager *Manager) copyToQuarantine(sourcePath, targetPath string) (copiedF
 		return copiedFile{}, err
 	}
 	digest := sha256.New()
-	written, err := io.Copy(io.MultiWriter(target, digest), io.LimitReader(source, manager.config.MediaIngest.MaxSegmentBytes+1))
-	if err != nil {
-		_ = target.Close()
-		return copiedFile{}, err
+	buffer := make([]byte, 1<<20)
+	written := int64(0)
+	limited := io.LimitReader(source, manager.config.MediaIngest.MaxSegmentBytes+1)
+	for {
+		read, readErr := limited.Read(buffer)
+		if read > 0 {
+			if err := manager.ensureMediaAllowed(); err != nil {
+				_ = target.Close()
+				return copiedFile{}, err
+			}
+			if _, err := target.Write(buffer[:read]); err != nil {
+				_ = target.Close()
+				return copiedFile{}, err
+			}
+			_, _ = digest.Write(buffer[:read])
+			written += int64(read)
+		}
+		if errors.Is(readErr, io.EOF) {
+			break
+		}
+		if readErr != nil {
+			_ = target.Close()
+			return copiedFile{}, readErr
+		}
 	}
 	if written > manager.config.MediaIngest.MaxSegmentBytes {
 		_ = target.Close()
 		return copiedFile{}, &Error{Code: CodeTooLarge, Err: errors.New("media is too large to quarantine")}
+	}
+	if err := manager.ensureMediaAllowed(); err != nil {
+		_ = target.Close()
+		return copiedFile{}, err
 	}
 	if err := target.Sync(); err != nil {
 		_ = target.Close()

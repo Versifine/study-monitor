@@ -14,6 +14,7 @@ import (
 	"github.com/Versifine/study-monitor/internal/httpapi"
 	"github.com/Versifine/study-monitor/internal/logging"
 	"github.com/Versifine/study-monitor/internal/mediaingest"
+	"github.com/Versifine/study-monitor/internal/operations"
 	"github.com/Versifine/study-monitor/internal/version"
 )
 
@@ -81,16 +82,37 @@ func Run(ctx context.Context, cfg config.Config, logger *logging.Logger, build v
 	var mediaStatus httpapi.MediaStatusProvider = mediaingest.NewFixedStatusProvider(mediaingest.ModuleDisabled, "")
 	var mediaManager *mediaingest.Manager
 	var collectorManager *collectors.Manager
+	var operationsManager *operations.Manager
 	if storeErr != nil {
 		failure = classifyStorageFailure(storeErr)
 		logger.Error("storage", "initialization_failed", failure.ErrorCode, "event storage initialization failed", storeErr)
 	} else {
 		defer store.Close()
-		if cfg.MediaIngest.Enabled {
-			mediaManager = mediaingest.New(cfg, store, logger)
-			mediaStatus = mediaManager
+		operationsManager = operations.New(cfg, store, logger)
+		operationsManager.Initialize(ctx)
+		operationsManager.RecordRuntimeMode(ctx, cfg.Runtime.Mode, "current-user", "startup_config", "CONFIG_MODE")
+		operationsManager.RecordModuleState(ctx, "dashboard", "disabled", "DASHBOARD_NOT_INSTALLED")
+		operationsManager.RecordModuleState(ctx, "coverage", "healthy", "ON_DEMAND_PROJECTION_ENABLED")
+		genericState, genericReason := "healthy", "GENERIC_JSON_ENABLED"
+		if cfg.Runtime.Mode == config.ModeMinimum {
+			genericState, genericReason = "disabled", "MINIMUM_MODE"
 		}
-		collectorManager = collectors.New(cfg, store, logger)
+		operationsManager.RecordModuleState(ctx, "generic_json", genericState, genericReason)
+		for _, collector := range cfg.Collectors {
+			state, reason := "healthy", "CONFIG_ENABLED"
+			if !collector.Enabled {
+				state, reason = "disabled", "CONFIG_DISABLED"
+			}
+			operationsManager.RecordModuleState(ctx, "collector:"+collector.ID, state, reason)
+		}
+		if cfg.MediaIngest.Enabled {
+			mediaManager = mediaingest.NewWithGate(cfg, store, logger, operationsManager)
+			mediaStatus = mediaManager
+			operationsManager.RecordModuleState(ctx, "media_ingest", "unavailable", "INITIALIZING")
+		} else {
+			operationsManager.RecordModuleState(ctx, "media_ingest", "disabled", "CONFIG_DISABLED")
+		}
+		collectorManager = collectors.NewWithFaultRecorder(cfg, store, logger, operationsManager)
 	}
 	if cfg.MediaIngest.Enabled && storeErr != nil {
 		mediaStatus = mediaingest.NewFixedStatusProvider(mediaingest.ModuleUnavailable, eventstore.ErrorCode(storeErr))
@@ -99,13 +121,22 @@ func Run(ctx context.Context, cfg config.Config, logger *logging.Logger, build v
 	defer cancel()
 	mediaDone := make(chan struct{})
 	collectorDone := make(chan struct{})
+	operationsDone := make(chan struct{})
+	if operationsManager != nil {
+		go func() { defer close(operationsDone); operationsManager.Run(runContext) }()
+	} else {
+		close(operationsDone)
+	}
 	if mediaManager != nil {
 		go func() {
 			defer close(mediaDone)
 			if err := mediaManager.Initialize(runContext); err != nil {
 				logger.Error("media_ingest", "initialization_failed", mediaingest.ErrorCode(err), "media ingest disabled after initialization failure", err)
+				operationsManager.RecordModuleState(runContext, "media_ingest", "unavailable", mediaingest.ErrorCode(err))
+				operationsManager.RecordFault(runContext, "media_ingest", "P2", "degraded", mediaingest.ErrorCode(err), err.Error())
 				return
 			}
+			operationsManager.RecordModuleState(runContext, "media_ingest", "healthy", "INITIALIZED")
 			mediaManager.Run(runContext)
 		}()
 	} else {
@@ -120,6 +151,9 @@ func Run(ctx context.Context, cfg config.Config, logger *logging.Logger, build v
 		close(collectorDone)
 	}
 	providers := []any{mediaStatus}
+	if operationsManager != nil {
+		providers = append(providers, operationsManager)
+	}
 	if collectorManager != nil {
 		providers = append(providers, collectorManager)
 	}
@@ -127,6 +161,7 @@ func Run(ctx context.Context, cfg config.Config, logger *logging.Logger, build v
 	cancel()
 	<-mediaDone
 	<-collectorDone
+	<-operationsDone
 	return err
 }
 

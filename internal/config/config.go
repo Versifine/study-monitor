@@ -36,6 +36,8 @@ const (
 	CodeInvalidRuntime    = "CONFIG_RUNTIME_INVALID"
 	CodeInvalidCollector  = "CONFIG_COLLECTOR_INVALID"
 	CodeInvalidTimeline   = "CONFIG_TIMELINE_INVALID"
+	CodeInvalidOperations = "CONFIG_OPERATIONS_INVALID"
+	CodeInvalidRetention  = "CONFIG_RETENTION_INVALID"
 	CodeInvalidLogLevel   = "CONFIG_LOG_LEVEL_INVALID"
 	CodeInvalidTimeout    = "CONFIG_TIMEOUT_INVALID"
 )
@@ -77,7 +79,7 @@ const (
 // LookupEnv matches os.LookupEnv and makes environment overrides deterministic in tests.
 type LookupEnv func(string) (string, bool)
 
-// Config is the complete Recorder Core configuration contract through M3.
+// Config is the complete Recorder Core configuration contract through M4.
 type Config struct {
 	SchemaVersion int               `json:"schema_version"`
 	Runtime       RuntimeConfig     `json:"runtime"`
@@ -88,6 +90,8 @@ type Config struct {
 	MediaIngest   MediaIngestConfig `json:"media_ingest"`
 	Collectors    []CollectorConfig `json:"collectors"`
 	Timeline      TimelineConfig    `json:"timeline"`
+	Operations    OperationsConfig  `json:"operations"`
+	Retention     RetentionConfig   `json:"retention"`
 	Logging       LoggingConfig     `json:"logging"`
 }
 
@@ -157,7 +161,10 @@ type ServerConfig struct {
 }
 
 type LoggingConfig struct {
-	Level string `json:"level"`
+	Level        string `json:"level"`
+	FileEnabled  bool   `json:"file_enabled"`
+	MaxFileBytes int64  `json:"max_file_bytes"`
+	MaxFiles     int    `json:"max_files"`
 }
 
 type PathsConfig struct {
@@ -165,8 +172,28 @@ type PathsConfig struct {
 }
 
 type StorageConfig struct {
-	BusyTimeout        string `json:"busy_timeout"`
-	MaxOpenConnections int    `json:"max_open_connections"`
+	BusyTimeout          string `json:"busy_timeout"`
+	MaxOpenConnections   int    `json:"max_open_connections"`
+	WarningFreeBytes     int64  `json:"warning_free_bytes"`
+	CriticalFreeBytes    int64  `json:"critical_free_bytes"`
+	DatabaseReserveBytes int64  `json:"database_reserve_bytes"`
+}
+
+type OperationsConfig struct {
+	DiskCheckInterval     string `json:"disk_check_interval"`
+	WALCheckpointInterval string `json:"wal_checkpoint_interval"`
+	WALMaxBytes           int64  `json:"wal_max_bytes"`
+	TempCleanupInterval   string `json:"temp_cleanup_interval"`
+	TempMaxAge            string `json:"temp_max_age"`
+	TempMaxFiles          int    `json:"temp_max_files"`
+}
+
+type RetentionConfig struct {
+	Enabled           bool   `json:"enabled"`
+	ScanInterval      string `json:"scan_interval"`
+	MinimumAge        string `json:"minimum_age"`
+	RequireFullBackup bool   `json:"require_full_backup"`
+	MaxDeletesPerRun  int    `json:"max_deletes_per_run"`
 }
 
 type APIConfig struct {
@@ -228,8 +255,11 @@ func defaultConfig() Config {
 		},
 		Paths: PathsConfig{DataDirectory: "data"},
 		Storage: StorageConfig{
-			BusyTimeout:        "5s",
-			MaxOpenConnections: 8,
+			BusyTimeout:          "5s",
+			MaxOpenConnections:   8,
+			WarningFreeBytes:     10 << 30,
+			CriticalFreeBytes:    5 << 30,
+			DatabaseReserveBytes: 1 << 30,
 		},
 		API: APIConfig{
 			MaxRequestBytes:     1 << 20,
@@ -257,7 +287,19 @@ func defaultConfig() Config {
 			MaxQueryRange:       "744h",
 			MaxProjectionFacts:  100000,
 		},
-		Logging: LoggingConfig{Level: "info"},
+		Operations: OperationsConfig{
+			DiskCheckInterval:     "30s",
+			WALCheckpointInterval: "5m",
+			WALMaxBytes:           64 << 20,
+			TempCleanupInterval:   "1h",
+			TempMaxAge:            "24h",
+			TempMaxFiles:          1000,
+		},
+		Retention: RetentionConfig{
+			Enabled: false, ScanInterval: "1h", MinimumAge: "168h",
+			RequireFullBackup: true, MaxDeletesPerRun: 100,
+		},
+		Logging: LoggingConfig{Level: "info", FileEnabled: true, MaxFileBytes: 10 << 20, MaxFiles: 5},
 	}
 }
 
@@ -298,7 +340,7 @@ func decodeFile(raw []byte, cfg *Config) error {
 	if err := strictjson.ValidateObjectKeys(raw, 0); err != nil {
 		return &Error{Code: CodeDecodeFailed, Err: errors.New("config JSON contains a duplicate key or is invalid")}
 	}
-	rootFields := []string{"schema_version", "runtime", "server", "paths", "storage", "api", "media_ingest", "collectors", "timeline", "logging"}
+	rootFields := []string{"schema_version", "runtime", "server", "paths", "storage", "api", "media_ingest", "collectors", "timeline", "operations", "retention", "logging"}
 	if err := strictjson.ValidateExactRootObject(raw, 1, rootFields...); err != nil {
 		return &Error{Code: CodeDecodeFailed, Err: errors.New("config root fields must exactly match the versioned schema")}
 	}
@@ -317,11 +359,13 @@ func decodeFile(raw []byte, cfg *Config) error {
 		{name: "runtime", allowed: []string{"mode", "backup_interface_enabled"}},
 		{name: "server", allowed: []string{"listen_address", "allow_non_loopback", "read_header_timeout", "read_timeout", "write_timeout", "idle_timeout", "shutdown_timeout"}},
 		{name: "paths", allowed: []string{"data_directory"}},
-		{name: "storage", allowed: []string{"busy_timeout", "max_open_connections"}},
+		{name: "storage", allowed: []string{"busy_timeout", "max_open_connections", "warning_free_bytes", "critical_free_bytes", "database_reserve_bytes"}},
 		{name: "api", allowed: []string{"max_request_bytes", "max_batch_events", "max_event_bytes", "max_payload_depth", "max_concurrent_writes", "default_page_size", "max_page_size"}},
 		{name: "media_ingest", allowed: []string{"enabled", "inbox_directory", "scan_interval", "settle_interval", "max_segment_bytes", "max_segment_duration", "max_sidecar_bytes", "max_scan_entries", "ffprobe_path", "ffprobe_timeout"}},
 		{name: "timeline", allowed: []string{"clock_uncertain_after", "max_query_range", "max_projection_facts"}},
-		{name: "logging", allowed: []string{"level"}},
+		{name: "operations", allowed: []string{"disk_check_interval", "wal_checkpoint_interval", "wal_max_bytes", "temp_cleanup_interval", "temp_max_age", "temp_max_files"}},
+		{name: "retention", allowed: []string{"enabled", "scan_interval", "minimum_age", "require_full_backup", "max_deletes_per_run"}},
+		{name: "logging", allowed: []string{"level", "file_enabled", "max_file_bytes", "max_files"}},
 	}
 	for _, section := range sections {
 		if value, ok := fields[section.name]; ok {
@@ -620,6 +664,9 @@ func (cfg Config) Validate() error {
 	default:
 		return &Error{Code: CodeInvalidLogLevel, Err: errors.New("logging.level must be debug, info, warn, or error")}
 	}
+	if cfg.Logging.MaxFileBytes < 1<<20 || cfg.Logging.MaxFileBytes > 1<<30 || cfg.Logging.MaxFiles < 2 || cfg.Logging.MaxFiles > 100 {
+		return &Error{Code: CodeInvalidLogLevel, Err: errors.New("logging rotation must satisfy 1MiB <= max_file_bytes <= 1GiB and 2 <= max_files <= 100")}
+	}
 
 	readHeaderTimeout, err := validateDuration("server.read_header_timeout", cfg.Server.ReadHeader)
 	if err != nil {
@@ -647,6 +694,39 @@ func (cfg Config) Validate() error {
 	}
 	if cfg.Storage.MaxOpenConnections < 1 || cfg.Storage.MaxOpenConnections > 32 {
 		return &Error{Code: CodeInvalidStorage, Err: errors.New("storage.max_open_connections must be between 1 and 32")}
+	}
+	if cfg.Storage.DatabaseReserveBytes < 64<<20 || cfg.Storage.CriticalFreeBytes <= cfg.Storage.DatabaseReserveBytes || cfg.Storage.WarningFreeBytes <= cfg.Storage.CriticalFreeBytes {
+		return &Error{Code: CodeInvalidStorage, Err: errors.New("storage thresholds must satisfy warning_free_bytes > critical_free_bytes > database_reserve_bytes >= 64MiB")}
+	}
+	if cfg.Storage.WarningFreeBytes > 1<<50 {
+		return &Error{Code: CodeInvalidStorage, Err: errors.New("storage.warning_free_bytes must not exceed 1PiB")}
+	}
+	if _, err := validateOperationsDuration("operations.disk_check_interval", cfg.Operations.DiskCheckInterval, time.Second, 10*time.Minute); err != nil {
+		return err
+	}
+	if _, err := validateOperationsDuration("operations.wal_checkpoint_interval", cfg.Operations.WALCheckpointInterval, time.Second, 24*time.Hour); err != nil {
+		return err
+	}
+	if _, err := validateOperationsDuration("operations.temp_cleanup_interval", cfg.Operations.TempCleanupInterval, time.Minute, 24*time.Hour); err != nil {
+		return err
+	}
+	if _, err := validateOperationsDuration("operations.temp_max_age", cfg.Operations.TempMaxAge, time.Hour, 30*24*time.Hour); err != nil {
+		return err
+	}
+	if cfg.Operations.WALMaxBytes < 1<<20 || cfg.Operations.WALMaxBytes > 4<<30 || cfg.Operations.TempMaxFiles < 1 || cfg.Operations.TempMaxFiles > 100000 {
+		return &Error{Code: CodeInvalidOperations, Err: errors.New("operations WAL or temporary-file limits are invalid")}
+	}
+	if _, err := validateRetentionDuration("retention.scan_interval", cfg.Retention.ScanInterval, time.Minute, 24*time.Hour); err != nil {
+		return err
+	}
+	if _, err := validateRetentionDuration("retention.minimum_age", cfg.Retention.MinimumAge, 24*time.Hour, 10*365*24*time.Hour); err != nil {
+		return err
+	}
+	if cfg.Retention.MaxDeletesPerRun < 1 || cfg.Retention.MaxDeletesPerRun > 10000 {
+		return &Error{Code: CodeInvalidRetention, Err: errors.New("retention.max_deletes_per_run must be between 1 and 10000")}
+	}
+	if cfg.Retention.Enabled && !cfg.Retention.RequireFullBackup {
+		return &Error{Code: CodeInvalidRetention, Err: errors.New("enabled retention requires a verified full backup")}
 	}
 	if cfg.API.MaxRequestBytes < 64<<10 || cfg.API.MaxRequestBytes > 16<<20 {
 		return &Error{Code: CodeInvalidAPILimit, Err: errors.New("api.max_request_bytes must be between 65536 and 16777216")}
@@ -915,6 +995,22 @@ func validateMediaDuration(name, value string, minimum, maximum time.Duration) (
 	return duration, nil
 }
 
+func validateOperationsDuration(name, value string, minimum, maximum time.Duration) (time.Duration, error) {
+	duration, err := time.ParseDuration(value)
+	if err != nil || duration < minimum || duration > maximum {
+		return 0, &Error{Code: CodeInvalidOperations, Err: fmt.Errorf("%s must be between %s and %s", name, minimum, maximum)}
+	}
+	return duration, nil
+}
+
+func validateRetentionDuration(name, value string, minimum, maximum time.Duration) (time.Duration, error) {
+	duration, err := time.ParseDuration(value)
+	if err != nil || duration < minimum || duration > maximum {
+		return 0, &Error{Code: CodeInvalidRetention, Err: fmt.Errorf("%s must be between %s and %s", name, minimum, maximum)}
+	}
+	return duration, nil
+}
+
 func validateDuration(name, value string) (time.Duration, error) {
 	duration, err := time.ParseDuration(value)
 	if err != nil || duration < 100*time.Millisecond || duration > 2*time.Minute {
@@ -955,6 +1051,38 @@ func (cfg Config) BusyTimeout() time.Duration {
 	duration, _ := time.ParseDuration(cfg.Storage.BusyTimeout)
 	return duration
 }
+
+func (cfg Config) DiskCheckInterval() time.Duration {
+	duration, _ := time.ParseDuration(cfg.Operations.DiskCheckInterval)
+	return duration
+}
+
+func (cfg Config) WALCheckpointInterval() time.Duration {
+	duration, _ := time.ParseDuration(cfg.Operations.WALCheckpointInterval)
+	return duration
+}
+
+func (cfg Config) TempCleanupInterval() time.Duration {
+	duration, _ := time.ParseDuration(cfg.Operations.TempCleanupInterval)
+	return duration
+}
+
+func (cfg Config) TempMaxAge() time.Duration {
+	duration, _ := time.ParseDuration(cfg.Operations.TempMaxAge)
+	return duration
+}
+
+func (cfg Config) RetentionScanInterval() time.Duration {
+	duration, _ := time.ParseDuration(cfg.Retention.ScanInterval)
+	return duration
+}
+
+func (cfg Config) RetentionMinimumAge() time.Duration {
+	duration, _ := time.ParseDuration(cfg.Retention.MinimumAge)
+	return duration
+}
+
+func (cfg Config) LogDirectory() string { return filepath.Join(cfg.Paths.DataDirectory, "logs") }
 
 func (cfg Config) DatabasePath() string {
 	return filepath.Join(cfg.Paths.DataDirectory, "exam-monitor.db")

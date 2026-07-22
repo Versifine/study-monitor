@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/Versifine/study-monitor/internal/collectors"
@@ -18,6 +19,7 @@ import (
 	"github.com/Versifine/study-monitor/internal/eventstore"
 	"github.com/Versifine/study-monitor/internal/logging"
 	"github.com/Versifine/study-monitor/internal/mediaingest"
+	"github.com/Versifine/study-monitor/internal/operations"
 	"github.com/Versifine/study-monitor/internal/strictjson"
 	"github.com/Versifine/study-monitor/internal/version"
 )
@@ -63,6 +65,17 @@ type CollectorStatusProvider interface {
 	Status(context.Context) []collectors.Status
 }
 
+type OperationsStatusProvider interface {
+	Status(context.Context) operations.Status
+}
+type WriteGate interface{ CoreWritesAllowed() (bool, string) }
+type FaultRecorder interface {
+	RecordFault(context.Context, string, string, string, string, string)
+}
+type ModuleStateRecorder interface {
+	RecordModuleState(context.Context, string, string, string)
+}
+
 type StorageFailure struct {
 	Status        string
 	SchemaVersion int
@@ -70,21 +83,35 @@ type StorageFailure struct {
 }
 
 type Handler struct {
-	config          config.Config
-	logger          *logging.Logger
-	build           version.Info
-	store           Store
-	storageFailure  StorageFailure
-	mediaStatus     MediaStatusProvider
-	collectorStatus CollectorStatusProvider
-	writes          chan struct{}
-	projections     chan struct{}
-	mux             *http.ServeMux
+	config           config.Config
+	logger           *logging.Logger
+	build            version.Info
+	store            Store
+	storageFailure   StorageFailure
+	mediaStatus      MediaStatusProvider
+	collectorStatus  CollectorStatusProvider
+	operationsStatus OperationsStatusProvider
+	writeGate        WriteGate
+	faultRecorder    FaultRecorder
+	moduleRecorder   ModuleStateRecorder
+	writes           chan struct{}
+	projections      chan struct{}
+	coverageDegraded atomic.Bool
+	mux              *http.ServeMux
 }
 
 func New(cfg config.Config, logger *logging.Logger, build version.Info, store Store, failure StorageFailure, providers ...any) *Handler {
 	var mediaStatus MediaStatusProvider = mediaingest.NewFixedStatusProvider(mediaingest.ModuleDisabled, "")
 	var collectorStatus CollectorStatusProvider = fixedCollectorStatus{}
+	fixedStatus := operations.Status{SchemaVersion: 1, DiskLevel: operations.DiskNormal, Retention: "disabled"}
+	if failure.ErrorCode != "" {
+		fixedStatus.DiskLevel = "unavailable"
+		fixedStatus.ErrorCode = failure.ErrorCode
+	}
+	var operationsStatus OperationsStatusProvider = fixedOperationsStatus{status: fixedStatus}
+	var writeGate WriteGate
+	var faultRecorder FaultRecorder
+	var moduleRecorder ModuleStateRecorder
 	for _, provider := range providers {
 		if typed, ok := provider.(MediaStatusProvider); ok && typed != nil {
 			mediaStatus = typed
@@ -92,18 +119,34 @@ func New(cfg config.Config, logger *logging.Logger, build version.Info, store St
 		if typed, ok := provider.(CollectorStatusProvider); ok && typed != nil {
 			collectorStatus = typed
 		}
+		if typed, ok := provider.(OperationsStatusProvider); ok && typed != nil {
+			operationsStatus = typed
+		}
+		if typed, ok := provider.(WriteGate); ok && typed != nil {
+			writeGate = typed
+		}
+		if typed, ok := provider.(FaultRecorder); ok && typed != nil {
+			faultRecorder = typed
+		}
+		if typed, ok := provider.(ModuleStateRecorder); ok && typed != nil {
+			moduleRecorder = typed
+		}
 	}
 	handler := &Handler{
-		config:          cfg,
-		logger:          logger,
-		build:           build,
-		store:           store,
-		storageFailure:  failure,
-		mediaStatus:     mediaStatus,
-		collectorStatus: collectorStatus,
-		writes:          make(chan struct{}, cfg.API.MaxConcurrentWrites),
-		projections:     make(chan struct{}, 1),
-		mux:             http.NewServeMux(),
+		config:           cfg,
+		logger:           logger,
+		build:            build,
+		store:            store,
+		storageFailure:   failure,
+		mediaStatus:      mediaStatus,
+		collectorStatus:  collectorStatus,
+		operationsStatus: operationsStatus,
+		writeGate:        writeGate,
+		faultRecorder:    faultRecorder,
+		moduleRecorder:   moduleRecorder,
+		writes:           make(chan struct{}, cfg.API.MaxConcurrentWrites),
+		projections:      make(chan struct{}, 1),
+		mux:              http.NewServeMux(),
 	}
 	handler.mux.HandleFunc("/health/live", handler.handleLiveness)
 	handler.mux.HandleFunc("/health/ready", handler.handleReadiness)
@@ -115,12 +158,26 @@ func New(cfg config.Config, logger *logging.Logger, build version.Info, store St
 	handler.mux.HandleFunc("/api/v1/timeline", handler.handleTimeline)
 	handler.mux.HandleFunc("/api/v1/coverage", handler.handleCoverage)
 	handler.mux.HandleFunc("/api/v1/media/ingest/status", handler.handleMediaIngestStatus)
+	handler.mux.HandleFunc("/api/v1/operations/status", handler.handleOperationsStatus)
 	return handler
 }
 
 type fixedCollectorStatus struct{}
 
 func (fixedCollectorStatus) Status(context.Context) []collectors.Status { return []collectors.Status{} }
+
+type fixedOperationsStatus struct{ status operations.Status }
+
+func (provider fixedOperationsStatus) Status(context.Context) operations.Status {
+	return provider.status
+}
+
+func (handler *Handler) handleOperationsStatus(writer http.ResponseWriter, request *http.Request) {
+	if !allowReadMethod(writer, request) {
+		return
+	}
+	writeJSON(writer, request, http.StatusOK, handler.operationsStatus.Status(request.Context()))
+}
 
 func (handler *Handler) handleMediaIngestStatus(writer http.ResponseWriter, request *http.Request) {
 	if !allowReadMethod(writer, request) {
@@ -168,6 +225,11 @@ func (handler *Handler) handleReadiness(writer http.ResponseWriter, request *htt
 	if handler.store != nil {
 		readiness = handler.store.Readiness(request.Context())
 	}
+	if handler.writeGate != nil {
+		if allowed, code := handler.writeGate.CoreWritesAllowed(); !allowed {
+			readiness.Status, readiness.ErrorCode = eventstore.ReadinessUnavailable, code
+		}
+	}
 	if readiness.Status == "" {
 		readiness.Status = eventstore.ReadinessUnavailable
 		readiness.ErrorCode = CodeStorageOffline
@@ -211,6 +273,12 @@ func (handler *Handler) handleEventBatch(writer http.ResponseWriter, request *ht
 	if handler.store == nil {
 		writeError(writer, request, http.StatusServiceUnavailable, CodeStorageOffline, "event storage is unavailable")
 		return
+	}
+	if handler.writeGate != nil {
+		if allowed, code := handler.writeGate.CoreWritesAllowed(); !allowed {
+			writeError(writer, request, http.StatusInsufficientStorage, code, "storage reserve is protected; write was not confirmed")
+			return
+		}
 	}
 
 	request.Body = http.MaxBytesReader(writer, request.Body, handler.config.API.MaxRequestBytes)
@@ -257,6 +325,12 @@ func (handler *Handler) handleEventBatch(writer http.ResponseWriter, request *ht
 	candidates := make([]eventstore.Candidate, len(envelope.Events))
 	for index := range envelope.Events {
 		candidates[index] = eventstore.Candidate{Raw: envelope.Events[index]}
+	}
+	if handler.writeGate != nil {
+		if allowed, code := handler.writeGate.CoreWritesAllowed(); !allowed {
+			writeError(writer, request, http.StatusInsufficientStorage, code, "storage reserve is protected; write was not confirmed")
+			return
+		}
 	}
 	results, err := handler.store.AppendBatch(request.Context(), candidates)
 	if err != nil {
@@ -340,6 +414,12 @@ func (handler *Handler) handleHeartbeatBatch(writer http.ResponseWriter, request
 		writeError(writer, request, http.StatusServiceUnavailable, CodeStorageOffline, "event storage is unavailable")
 		return
 	}
+	if handler.writeGate != nil {
+		if allowed, code := handler.writeGate.CoreWritesAllowed(); !allowed {
+			writeError(writer, request, http.StatusInsufficientStorage, code, "storage reserve is protected; heartbeat was not confirmed")
+			return
+		}
+	}
 	request.Body = http.MaxBytesReader(writer, request.Body, handler.config.API.MaxRequestBytes)
 	rawBody, err := io.ReadAll(request.Body)
 	if err != nil {
@@ -380,6 +460,12 @@ func (handler *Handler) handleHeartbeatBatch(writer http.ResponseWriter, request
 	candidates := make([]eventstore.HeartbeatCandidate, len(envelope.Heartbeats))
 	for index := range envelope.Heartbeats {
 		candidates[index] = eventstore.HeartbeatCandidate{Raw: envelope.Heartbeats[index]}
+	}
+	if handler.writeGate != nil {
+		if allowed, code := handler.writeGate.CoreWritesAllowed(); !allowed {
+			writeError(writer, request, http.StatusInsufficientStorage, code, "storage reserve is protected; heartbeat was not confirmed")
+			return
+		}
 	}
 	results, err := handler.store.AppendHeartbeatBatch(request.Context(), candidates)
 	if err != nil {
@@ -462,8 +548,24 @@ func (handler *Handler) handleCoverage(writer http.ResponseWriter, request *http
 			writeError(writer, request, http.StatusBadRequest, code, "coverage query is invalid")
 			return
 		}
+		if !handler.coverageDegraded.Swap(true) {
+			if handler.faultRecorder != nil {
+				handler.faultRecorder.RecordFault(request.Context(), "coverage", "P2", "degraded", code, err.Error())
+			}
+			if handler.moduleRecorder != nil {
+				handler.moduleRecorder.RecordModuleState(request.Context(), "coverage", "degraded", code)
+			}
+		}
 		handler.writeStoreError(writer, request, "coverage_query_failed", err)
 		return
+	}
+	if handler.coverageDegraded.Swap(false) {
+		if handler.faultRecorder != nil {
+			handler.faultRecorder.RecordFault(request.Context(), "coverage", "P3", "recovered", "COVERAGE_RECOVERED", "coverage rebuild recovered")
+		}
+		if handler.moduleRecorder != nil {
+			handler.moduleRecorder.RecordModuleState(request.Context(), "coverage", "healthy", "COVERAGE_RECOVERED")
+		}
 	}
 	writeJSON(writer, request, http.StatusOK, struct {
 		SchemaVersion int `json:"schema_version"`
